@@ -81,7 +81,7 @@ class MainActivity : Activity(), SensorEventListener {
                 val ax = event.values[0] / SensorManager.GRAVITY_EARTH
                 val ay = event.values[1] / SensorManager.GRAVITY_EARTH
                 val az = event.values[2] / SensorManager.GRAVITY_EARTH
-                renderer.setGravity(-ax, ay, az, event.timestamp)
+                renderer.setGravity(-ax, ay, az, event.timestamp, ax, ay, az)
             }
             Sensor.TYPE_LINEAR_ACCELERATION -> {
                 renderer.setShakeAcceleration(
@@ -99,6 +99,9 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     @Volatile private var targetGravityY = 1f
     @Volatile private var targetGravityZ = 0f
     @Volatile private var gravityJitterG = 0f
+    @Volatile private var rawSensorX = 0f
+    @Volatile private var rawSensorY = 0f
+    @Volatile private var rawSensorZ = 0f
     @Volatile private var shake = 0f
     @Volatile private var pendingShakeX = 0f
     @Volatile private var pendingShakeZ = 0f
@@ -128,12 +131,15 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     private var flowHandle = 0
     private var program = 0
     private var timeHandle = 0
-    private var gravityHandle = 0
+    private var upHandle = 0
     private var resolutionHandle = 0
     private var shakeHandle = 0
     private var surfaceOffsetHandle = 0
     private val volumeSolver = SurfaceVolumeSolver()
     private var lastGoodSurfaceOffset = 0f
+    private val upSignX = -1f
+    private val upSignZ = 1f
+    private val computedUp = FloatArray(3)
     private var frameCounter = 0L
     private var lastDiagnosticsNanos = 0L
     private var startNanos = 0L
@@ -141,7 +147,13 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     private lateinit var vertexBuffer: FloatBuffer
 
     @Synchronized
-    fun setGravity(x: Float, y: Float, z: Float, timestampNanos: Long) {
+    fun setGravity(
+        x: Float, y: Float, z: Float, timestampNanos: Long,
+        rawX: Float, rawY: Float, rawZ: Float
+    ) {
+        rawSensorX = rawX
+        rawSensorY = rawY
+        rawSensorZ = rawZ
         val magnitude = kotlin.math.sqrt(x * x + y * y + z * z)
         if (!magnitude.isFinite() || magnitude < 0.35f) return
         val rx = x / magnitude
@@ -242,7 +254,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
             in vec2 vUv;
             out vec4 fragColor;
             uniform vec2 uResolution;
-            uniform vec3 uGravity;
+            uniform vec3 uUp;
             uniform float uTime;
             uniform float uShake;
             uniform float uSurfaceOffset;
@@ -303,8 +315,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 vec3 q = abs(p) - b + r;
                 return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
             }
-            vec3 surfaceNormal(vec3 p, vec3 g) {
-                vec3 n = normalize(vec3(-g.x, max(0.16, abs(g.y)), -g.z));
+            vec3 surfaceNormal(vec3 p, vec3 up) {
+                vec3 n = normalize(up);
                 float w = 0.010 * sin(p.x * 13.0 + uTime * 1.7)
                         + 0.006 * sin(p.z * 19.0 - uTime * 1.25)
                         + uShake * 0.012 * sin(p.x * 23.0 + p.z * 17.0 - uTime * 7.0);
@@ -312,8 +324,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                                            0.0,
                                            -0.11 * cos(p.z * 19.0 - uTime * 1.25)));
             }
-            float waterDistance(vec3 p, vec3 g) {
-                vec3 n = normalize(vec3(-g.x, max(0.16, abs(g.y)), -g.z));
+            float waterDistance(vec3 p, vec3 up) {
+                vec3 n = normalize(up);
                 float energy = clamp(length(uFlow) * 0.018 + uShake * 0.008, 0.0, 0.032);
                 vec2 fluidUv = clamp(vec2(p.x / (2.0 * TANK.x) + 0.5,
                                           p.z / (2.0 * TANK.z) + 0.5), 0.0, 1.0);
@@ -325,19 +337,19 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 float freeSurface = dot(p, n) + uSurfaceOffset + wave - simulatedHeight;
                 return max(container, freeSurface);
             }
-            vec3 waterNormal(vec3 p, vec3 g) {
+            vec3 waterNormal(vec3 p, vec3 up) {
                 float e = 0.0025;
                 return normalize(vec3(
-                    waterDistance(p + vec3(e,0,0),g) - waterDistance(p - vec3(e,0,0),g),
-                    waterDistance(p + vec3(0,e,0),g) - waterDistance(p - vec3(0,e,0),g),
-                    waterDistance(p + vec3(0,0,e),g) - waterDistance(p - vec3(0,0,e),g)
+                    waterDistance(p + vec3(e,0,0),up) - waterDistance(p - vec3(e,0,0),up),
+                    waterDistance(p + vec3(0,e,0),up) - waterDistance(p - vec3(0,e,0),up),
+                    waterDistance(p + vec3(0,0,e),up) - waterDistance(p - vec3(0,0,e),up)
                 ));
             }
-            bool traceWater(vec3 ro, vec3 rd, vec3 g, out vec3 hit, out float travel) {
+            bool traceWater(vec3 ro, vec3 rd, vec3 up, out vec3 hit, out float travel) {
                 travel = 0.0;
                 for (int i = 0; i < 88; i++) {
                     vec3 p = ro + rd * travel;
-                    float d = waterDistance(p, g);
+                    float d = waterDistance(p, up);
                     if (d < 0.0018) { hit = p; return true; }
                     travel += max(d * 0.72, 0.0015);
                     if (travel > 7.0) break;
@@ -351,7 +363,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 vec2 screen = (uv - 0.5) * vec2(aspect, 1.0);
                 vec3 ro = vec3(0.0, 0.0, 3.35);
                 vec3 rd = normalize(vec3(screen * 1.48, -1.85));
-                vec3 g = normalize(uGravity);
+                vec3 up = normalize(uUp);
                 vec3 background = vec3(0.009, 0.025, 0.038);
                 // Keep the background uniform: the old radial halo looked like a
                 // persistent glowing blob trapped in the center of the water.
@@ -360,9 +372,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 vec3 hit;
                 float travel;
                 vec3 color = background;
-                if (traceWater(ro, rd, g, hit, travel)) {
-                    vec3 n = waterNormal(hit, g);
-                    vec3 up = normalize(vec3(-g.x, max(0.16, abs(g.y)), -g.z));
+                if (traceWater(ro, rd, up, hit, travel)) {
+                    vec3 n = waterNormal(hit, up);
                     vec3 viewDir = normalize(ro - hit);
                     vec3 lightDir = normalize(vec3(-0.45, 0.78, 0.62));
 
@@ -406,6 +417,41 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
 
                     color = mix(body, top, surfaceFactor);
 
+                    // When the camera looks almost along the surface normal (phone
+                    // face-up), the visible hit is the water/air interface. Shade the
+                    // liquid as a transparent volume so the far glass remains visible.
+                    // The ordinary side-on path below remains unchanged for upright use.
+                    float viewAlignment = dot(up, viewDir);
+                    if (viewAlignment > 0.82) {
+                        vec3 innerHalf = TANK - vec3(0.018);
+                        float tx = abs(rd.x) < 0.0001 ? 1e4 :
+                            (rd.x > 0.0 ? (innerHalf.x - hit.x) / rd.x : (-innerHalf.x - hit.x) / rd.x);
+                        float ty = abs(rd.y) < 0.0001 ? 1e4 :
+                            (rd.y > 0.0 ? (innerHalf.y - hit.y) / rd.y : (-innerHalf.y - hit.y) / rd.y);
+                        float tz = abs(rd.z) < 0.0001 ? 1e4 :
+                            (rd.z > 0.0 ? (innerHalf.z - hit.z) / rd.z : (-innerHalf.z - hit.z) / rd.z);
+                        float exitT = min(tx, min(ty, tz));
+                        if (exitT > 0.0 && exitT < 2.0) {
+                            vec3 backPoint = hit + rd * exitT;
+                            vec3 backNormal = tx <= ty && tx <= tz ? vec3(sign(rd.x),0.0,0.0)
+                                              : (ty <= tz ? vec3(0.0,sign(rd.y),0.0)
+                                                          : vec3(0.0,0.0,sign(rd.z)));
+                            float backCaustics = triCaustics(backPoint, backNormal);
+                            float backBubbles = bubbles(backPoint.xy, uTime * 0.72);
+                            vec3 backGlass = vec3(0.025, 0.105, 0.16);
+                            backGlass += vec3(0.10, 0.39, 0.39) * backCaustics * 0.72;
+                            backGlass += vec3(0.48, 0.82, 0.78) * backBubbles * 0.34;
+
+                            // Wavelength-dependent absorption gives the shallow layer
+                            // turquoise color while retaining detail on the far glass.
+                            vec3 transmittance = exp(-vec3(1.10, 0.48, 0.30) * exitT);
+                            vec3 transmitted = backGlass * transmittance
+                                             + vec3(0.035, 0.22, 0.23) * (1.0 - transmittance);
+                            float fresnel = 0.02 + 0.12 * pow(1.0 - clamp(dot(n, viewDir), 0.0, 1.0), 5.0);
+                            color = mix(transmitted, top, fresnel);
+                        }
+                    }
+
                     // Thin warm-ivory meniscus where the water meets the glass.
                     float foam = 1.0 - smoothstep(0.006, 0.026, abs(s));
                     float sideFace = 1.0 - surfaceFactor;
@@ -438,7 +484,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         vertexBuffer.put(quad).position(0)
         program = linkProgram(vertex, fragment)
         timeHandle = GLES30.glGetUniformLocation(program, "uTime")
-        gravityHandle = GLES30.glGetUniformLocation(program, "uGravity")
+        upHandle = GLES30.glGetUniformLocation(program, "uUp")
         resolutionHandle = GLES30.glGetUniformLocation(program, "uResolution")
         shakeHandle = GLES30.glGetUniformLocation(program, "uShake")
         surfaceOffsetHandle = GLES30.glGetUniformLocation(program, "uSurfaceOffset")
@@ -512,13 +558,11 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val time = (now - startNanos) / 1_000_000_000f
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glUseProgram(program)
+        val up = computeUp(springGravityX, springGravityY, springGravityZ)
         GLES30.glUniform1f(timeHandle, time)
-        GLES30.glUniform3f(gravityHandle, springGravityX, springGravityY, springGravityZ)
+        GLES30.glUniform3f(upHandle, up[0], up[1], up[2])
         GLES30.glUniform1f(shakeHandle, shake)
-        val surfaceNormalX = -springGravityX
-        val surfaceNormalY = max(0.16f, abs(springGravityY))
-        val surfaceNormalZ = -springGravityZ
-        val rawSurfaceOffset = volumeSolver.offsetForHalfFill(surfaceNormalX, surfaceNormalY, surfaceNormalZ)
+        val rawSurfaceOffset = volumeSolver.offsetForHalfFill(up[0], up[1], up[2])
         if (rawSurfaceOffset.isFinite()) {
             lastGoodSurfaceOffset = rawSurfaceOffset.coerceIn(-1.5f, 1.5f)
         }
@@ -545,11 +589,25 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         if (now - lastDiagnosticsNanos >= 250_000_000L) {
             lastDiagnosticsNanos = now
             onDiagnostics(
-                "frames: $frameCounter   jitter: %.3f g   gravity: %.2f, %.2f, %.2f   offset: %.4f".format(
-                    gravityJitterG, springGravityX, springGravityY, springGravityZ, lastGoodSurfaceOffset
+                "frames: $frameCounter   jitter: %.3f g\nraw accel(g): %.2f, %.2f, %.2f\nup: %.2f, %.2f, %.2f  signs: %.0f/%.0f  offset: %.4f".format(
+                    gravityJitterG, rawSensorX, rawSensorY, rawSensorZ,
+                    up[0], up[1], up[2], upSignX, upSignZ, lastGoodSurfaceOffset
                 )
             )
         }
+    }
+
+    private fun computeUp(gx: Float, gy: Float, gz: Float): FloatArray {
+        // Stage 0 device test confirmed the face-up Z direction is inverted with -1.
+        // Keep X unchanged; flip only Z so the solver and shader share the corrected up vector.
+        val x = upSignX * gx
+        val y = max(0.16f, abs(gy))
+        val z = upSignZ * gz
+        val length = kotlin.math.sqrt(x * x + y * y + z * z).coerceAtLeast(0.0001f)
+        computedUp[0] = x / length
+        computedUp[1] = y / length
+        computedUp[2] = z / length
+        return computedUp
     }
 
     private fun linkProgram(vertexSource: String, fragmentSource: String): Int {
