@@ -11,8 +11,8 @@ android {
         applicationId = "com.myos.liquidlab"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.3.8-stage0"
+        versionCode = 14
+        versionName = "0.4.2-optics-stage1"
     }
 
     compileOptions {
