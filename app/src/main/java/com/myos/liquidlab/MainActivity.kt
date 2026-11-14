@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.view.View
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.FloatBuffer
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -73,6 +74,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
     private var shakeHandle = 0
     private var startNanos = 0L
     private var lastNanos = 0L
+    private lateinit var vertexBuffer: FloatBuffer
 
     fun setGravity(x: Float, y: Float, z: Float) {
         gravityX = x
@@ -152,7 +154,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
             }
             bool traceWater(vec3 ro, vec3 rd, vec3 g, out vec3 hit, out float travel) {
                 travel = 0.0;
-                for (int i = 0; i < 110; i++) {
+                for (int i = 0; i < 88; i++) {
                     vec3 p = ro + rd * travel;
                     float d = waterDistance(p, g);
                     if (d < 0.0018) { hit = p; return true; }
@@ -214,6 +216,9 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
             }
         """.trimIndent()
 
+        val quad = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
+        vertexBuffer = ByteBuffer.allocateDirect(quad.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        vertexBuffer.put(quad).position(0)
         program = linkProgram(vertex, fragment)
         timeHandle = GLES30.glGetUniformLocation(program, "uTime")
         gravityHandle = GLES30.glGetUniformLocation(program, "uGravity")
@@ -241,11 +246,9 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         val viewport = IntArray(4)
         GLES30.glGetIntegerv(GLES30.GL_VIEWPORT, viewport, 0)
         GLES30.glUniform2f(resolutionHandle, viewport[2].toFloat(), viewport[3].toFloat())
-        val vertices = floatArrayOf(-1f,-1f, 1f,-1f, -1f,1f, 1f,1f)
-        val buffer = ByteBuffer.allocateDirect(vertices.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
-        buffer.put(vertices).position(0)
+        vertexBuffer.position(0)
         GLES30.glEnableVertexAttribArray(0)
-        GLES30.glVertexAttribPointer(0, 2, GLES30.GL_FLOAT, false, 0, buffer)
+        GLES30.glVertexAttribPointer(0, 2, GLES30.GL_FLOAT, false, 0, vertexBuffer)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
         GLES30.glDisableVertexAttribArray(0)
     }
