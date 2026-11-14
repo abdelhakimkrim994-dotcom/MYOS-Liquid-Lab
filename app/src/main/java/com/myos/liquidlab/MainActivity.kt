@@ -665,8 +665,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 float topGlare = exp(-pow((pNear.y - 0.85)*38.0,2.0)) *
                                  smoothstep(-0.34,0.34,pNear.x) * inRect;
                 color += vec3(1.0,1.0,1.0) * topGlare * 0.30;
-                float vignette = 1.0 - smoothstep(0.25, 1.05, length(screen*vec2(0.85,0.72)));
-                color *= 0.72 + 0.28*vignette;
+                // No global vignette: the white test field must remain uniformly white.
                 // Gentle exponential tone mapping keeps highlights bright without clipping.
                 color = 1.0 - exp(-max(color, vec3(0.0)) * 1.35);
                 fragColor = vec4(color,1.0);
