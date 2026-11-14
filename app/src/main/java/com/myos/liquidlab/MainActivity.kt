@@ -382,7 +382,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                                            0.0,
                                            -0.11 * cos(p.z * 19.0 - uTime * 1.25)));
             }
-            float waterDistance(vec3 p, vec3 up) {
+            float freeSurfaceDistance(vec3 p, vec3 up, float surfaceOffset) {
                 vec3 n = normalize(up);
                 float energy = clamp(length(uFlow) * 0.018 + uShake * 0.008, 0.0, 0.032);
                 vec2 fluidUv = clamp(vec2(p.x / (2.0 * TANK.x) + 0.5,
@@ -391,9 +391,22 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 float wave = 0.0025 * sin(p.x * 11.0 + uTime * 1.1)
                            + 0.0018 * sin(p.z * 15.0 - uTime * 0.9)
                            + energy * sin(p.x * 10.0 + p.z * 7.0 - uTime * 3.6);
+                return dot(p, n) + surfaceOffset + wave - simulatedHeight;
+            }
+            float waterDistance(vec3 p, vec3 up) {
                 float container = sdRoundBox(p, TANK - vec3(0.018), 0.025);
-                float freeSurface = dot(p, n) + uSurfaceOffset + wave - simulatedHeight;
-                return max(container, freeSurface);
+                return max(container, freeSurfaceDistance(p, up, uSurfaceOffset));
+            }
+            vec3 displacedSurfaceNormal(vec3 p, vec3 up, float surfaceOffset) {
+                float e = 0.0025;
+                return normalize(vec3(
+                    freeSurfaceDistance(p + vec3(e,0,0), up, surfaceOffset) -
+                    freeSurfaceDistance(p - vec3(e,0,0), up, surfaceOffset),
+                    freeSurfaceDistance(p + vec3(0,e,0), up, surfaceOffset) -
+                    freeSurfaceDistance(p - vec3(0,e,0), up, surfaceOffset),
+                    freeSurfaceDistance(p + vec3(0,0,e), up, surfaceOffset) -
+                    freeSurfaceDistance(p - vec3(0,0,e), up, surfaceOffset)
+                ));
             }
             vec3 waterNormal(vec3 p, vec3 up) {
                 float e = 0.0025;
@@ -434,11 +447,39 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                             vec3 wb, out vec3 nOut, out float viaSurface) {
                 vec3 boxNormal;
                 float tBox = exitBox(p, r, wb, boxNormal);
-                float ds = dot(r, up);
-                float tSurface = ds > 0.0001
-                    ? max(-(dot(p, up) + surfaceOffset) / ds, 0.0) : 1e9;
+                float tSurface = 1e9;
+                vec3 surfaceNormalOut = normalize(up);
+
+                // Find the first inside-to-outside crossing of the same displaced
+                // free surface used by waterDistance(). The tank-wall path remains
+                // the existing analytic inner-box approximation.
+                float previousT = 0.0;
+                float previousF = freeSurfaceDistance(p, up, surfaceOffset);
+                if (previousF < 0.0 && tBox > 0.0 && tBox < 1e8) {
+                    for (int i = 1; i <= 16; i++) {
+                        float sampleT = tBox * (float(i) / 16.0);
+                        float sampleF = freeSurfaceDistance(p + r * sampleT, up, surfaceOffset);
+                        if (previousF < 0.0 && sampleF >= 0.0) {
+                            float lo = previousT;
+                            float hi = sampleT;
+                            for (int j = 0; j < 10; j++) {
+                                float mid = 0.5 * (lo + hi);
+                                float midF = freeSurfaceDistance(p + r * mid, up, surfaceOffset);
+                                if (midF < 0.0) lo = mid;
+                                else hi = mid;
+                            }
+                            tSurface = hi;
+                            surfaceNormalOut = displacedSurfaceNormal(
+                                p + r * tSurface, up, surfaceOffset);
+                            break;
+                        }
+                        previousT = sampleT;
+                        previousF = sampleF;
+                    }
+                }
+
                 if (tSurface < tBox) {
-                    nOut = normalize(up);
+                    nOut = surfaceNormalOut;
                     viaSurface = 1.0;
                     return tSurface;
                 }
