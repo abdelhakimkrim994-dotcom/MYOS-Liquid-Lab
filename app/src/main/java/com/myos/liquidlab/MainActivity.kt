@@ -102,9 +102,10 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     @Volatile private var rawSensorX = 0f
     @Volatile private var rawSensorY = 0f
     @Volatile private var rawSensorZ = 0f
-    @Volatile private var shake = 0f
-    @Volatile private var pendingShakeX = 0f
-    @Volatile private var pendingShakeZ = 0f
+    private val shakeLock = Any()
+    private var shake = 0f
+    private var pendingShakeX = 0f
+    private var pendingShakeZ = 0f
     private var filteredGravityX = 0f
     private var filteredGravityY = 1f
     private var filteredGravityZ = 0f
@@ -256,11 +257,13 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val threshold = 1.6f // m/s²; linear-acceleration sensor has gravity removed.
         if (!magnitude.isFinite() || magnitude <= threshold) return
         val strength = ((magnitude - threshold) / SensorManager.GRAVITY_EARTH).coerceIn(0f, 1.4f)
-        pendingShakeX = (pendingShakeX - x / SensorManager.GRAVITY_EARTH * 0.16f).coerceIn(-0.35f, 0.35f)
-        pendingShakeZ = (pendingShakeZ + z / SensorManager.GRAVITY_EARTH * 0.16f).coerceIn(-0.35f, 0.35f)
+        synchronized(shakeLock) {
+            pendingShakeX = (pendingShakeX - x / SensorManager.GRAVITY_EARTH * 0.16f).coerceIn(-0.35f, 0.35f)
+            pendingShakeZ = (pendingShakeZ + z / SensorManager.GRAVITY_EARTH * 0.16f).coerceIn(-0.35f, 0.35f)
+            shake = min(1.6f, shake + strength * 0.65f)
+        }
         fluidSimulation.addImpulse(-x / SensorManager.GRAVITY_EARTH * 0.38f,
             z / SensorManager.GRAVITY_EARTH * 0.38f)
-        shake = min(1.6f, shake + strength * 0.65f)
     }
 
     override fun onSurfaceCreated(glUnused: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
@@ -646,7 +649,13 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val quad = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
         vertexBuffer = ByteBuffer.allocateDirect(quad.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
         vertexBuffer.put(quad).position(0)
-        program = linkProgram(vertex, fragment)
+        program = try {
+            linkProgram(vertex, fragment)
+        } catch (error: Exception) {
+            onDiagnostics("GLSL initialization failed: ${error.message ?: "unknown shader error"}")
+            0
+        }
+        if (program == 0) return
         timeHandle = GLES30.glGetUniformLocation(program, "uTime")
         upHandle = GLES30.glGetUniformLocation(program, "uUp")
         eyeHandle = GLES30.glGetUniformLocation(program, "uEye")
@@ -659,8 +668,13 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         GLES30.glGenTextures(1, textureIds, 0)
         fluidHeightTexture = textureIds[0]
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, fluidHeightTexture)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        // R32F linear filtering is not guaranteed on every ES 3.0 device.
+        // Use linear when the extension is exposed; otherwise fall back safely.
+        val floatLinear = GLES30.glGetString(GLES30.GL_EXTENSIONS)
+            ?.contains("GL_OES_texture_float_linear") == true
+        val heightFilter = if (floatLinear) GLES30.GL_LINEAR else GLES30.GL_NEAREST
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, heightFilter)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, heightFilter)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
         val gridSize = fluidSimulation.resolution()
@@ -678,7 +692,17 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val now = System.nanoTime()
         val dt = ((now - lastNanos) / 1_000_000_000f).coerceIn(0f, 0.05f)
         lastNanos = now
-        shake = max(0f, shake - dt * 1.25f)
+        val frameShake: Float
+        val kickX: Float
+        val kickZ: Float
+        synchronized(shakeLock) {
+            shake = max(0f, shake - dt * 1.25f)
+            frameShake = shake
+            kickX = pendingShakeX
+            kickZ = pendingShakeZ
+            pendingShakeX = 0f
+            pendingShakeZ = 0f
+        }
 
         // A 0.7 Hz damped spring (zeta 0.30) gives the whole gravity vector
         // physical follow-through. Substeps keep integration stable across frame rates.
@@ -713,21 +737,18 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         springGravityZ /= springLength
 
         // Shake contributes a short momentum kick, never a change to the sensor target.
-        val kickX = pendingShakeX
-        val kickZ = pendingShakeZ
-        pendingShakeX = 0f
-        pendingShakeZ = 0f
         springVelocityX += kickX
         springVelocityZ += kickZ
         fluidSimulation.step(dt)
         val time = (now - startNanos) / 1_000_000_000f
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+        if (program == 0) return
         GLES30.glUseProgram(program)
         val up = computeUp(springGravityX, springGravityY, springGravityZ)
         GLES30.glUniform1f(timeHandle, time)
         GLES30.glUniform3f(upHandle, up[0], up[1], up[2])
         GLES30.glUniform2f(eyeHandle, eyeX, eyeY)
-        GLES30.glUniform1f(shakeHandle, shake)
+        GLES30.glUniform1f(shakeHandle, frameShake)
         val rawSurfaceOffset = volumeSolver.offsetForHalfFill(up[0], up[1], up[2])
         if (rawSurfaceOffset.isFinite()) {
             lastGoodSurfaceOffset = rawSurfaceOffset.coerceIn(-1.5f, 1.5f)
