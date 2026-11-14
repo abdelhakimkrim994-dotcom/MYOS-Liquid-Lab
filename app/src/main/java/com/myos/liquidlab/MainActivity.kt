@@ -72,6 +72,13 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
     private var filteredX = 0f
     private var filteredY = 1f
     private var filteredZ = 0f
+    private var fluidX = 0f
+    private var fluidZ = 0f
+    private var fluidVelocityX = 0f
+    private var fluidVelocityZ = 0f
+    @Volatile private var pendingImpulseX = 0f
+    @Volatile private var pendingImpulseZ = 0f
+    private var flowHandle = 0
     private var program = 0
     private var timeHandle = 0
     private var gravityHandle = 0
@@ -87,7 +94,11 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         val dy = y - previousY
         val dz = z - previousZ
         val motion = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
-        if (motion > 0.10f) shake = min(1.6f, shake + motion * 0.72f)
+        if (motion > 0.035f) {
+            shake = min(1.6f, shake + motion * 0.92f)
+            pendingImpulseX += (x - previousX) * 0.48f
+            pendingImpulseZ += (z - previousZ) * 0.48f
+        }
         previousX = x
         previousY = y
         previousZ = z
@@ -120,6 +131,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
             uniform vec3 uGravity;
             uniform float uTime;
             uniform float uShake;
+            uniform vec2 uFlow;
 
             const vec3 TANK = vec3(0.405, 0.885, 0.305);
             float hash(vec3 p) {
@@ -238,6 +250,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         gravityHandle = GLES30.glGetUniformLocation(program, "uGravity")
         resolutionHandle = GLES30.glGetUniformLocation(program, "uResolution")
         shakeHandle = GLES30.glGetUniformLocation(program, "uShake")
+        flowHandle = GLES30.glGetUniformLocation(program, "uFlow")
         startNanos = System.nanoTime()
         lastNanos = startNanos
     }
@@ -250,13 +263,24 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         val now = System.nanoTime()
         val dt = ((now - lastNanos) / 1_000_000_000f).coerceIn(0f, 0.04f)
         lastNanos = now
-        shake = max(0f, shake - dt * 0.82f)
+        shake = max(0f, shake - dt * 1.25f)
+        fluidVelocityX += pendingImpulseX
+        fluidVelocityZ += pendingImpulseZ
+        pendingImpulseX = 0f
+        pendingImpulseZ = 0f
+        val targetX = (gravityX * 0.82f).coerceIn(-1.15f, 1.15f)
+        val targetZ = (gravityZ * 0.82f).coerceIn(-1.15f, 1.15f)
+        fluidVelocityX += ((targetX - fluidX) * 5.2f - fluidVelocityX * 2.05f) * dt
+        fluidVelocityZ += ((targetZ - fluidZ) * 5.2f - fluidVelocityZ * 2.05f) * dt
+        fluidX = (fluidX + fluidVelocityX * dt).coerceIn(-1.25f, 1.25f)
+        fluidZ = (fluidZ + fluidVelocityZ * dt).coerceIn(-1.25f, 1.25f)
         val time = (now - startNanos) / 1_000_000_000f
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glUseProgram(program)
         GLES30.glUniform1f(timeHandle, time)
-        GLES30.glUniform3f(gravityHandle, gravityX, gravityY, gravityZ)
+        GLES30.glUniform3f(gravityHandle, fluidX, gravityY, fluidZ)
         GLES30.glUniform1f(shakeHandle, shake)
+        GLES30.glUniform2f(flowHandle, fluidVelocityX, fluidVelocityZ)
         val viewport = IntArray(4)
         GLES30.glGetIntegerv(GLES30.GL_VIEWPORT, viewport, 0)
         GLES30.glUniform2f(resolutionHandle, viewport[2].toFloat(), viewport[3].toFloat())
