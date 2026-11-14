@@ -149,10 +149,11 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
                                            -0.11 * cos(p.z * 19.0 - uTime * 1.25)));
             }
             float waterDistance(vec3 p, vec3 g) {
-                vec3 n = normalize(vec3(-g.x, 1.0, -g.y));
-                float wave = 0.010 * sin(p.x * 13.0 + uTime * 1.7)
-                           + 0.006 * sin(p.z * 19.0 - uTime * 1.25)
-                           + uShake * 0.012 * sin(p.x * 23.0 + p.z * 17.0 - uTime * 7.0);
+                vec3 n = normalize(vec3(-g.x, max(0.16, abs(g.y)), -g.z));
+                float energy = clamp(length(uFlow) * 0.018 + uShake * 0.008, 0.0, 0.032);
+                float wave = 0.004 * sin(p.x * 11.0 + uTime * 1.4)
+                           + 0.003 * sin(p.z * 15.0 - uTime * 1.1)
+                           + energy * sin(p.x * 10.0 + p.z * 7.0 - uTime * 4.2);
                 float container = sdRoundBox(p, TANK - vec3(0.018), 0.025);
                 float freeSurface = dot(p, n) + 0.055 + wave;
                 return max(container, freeSurface);
