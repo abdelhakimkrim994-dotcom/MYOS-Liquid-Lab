@@ -349,7 +349,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 travel = 0.0;
                 for (int i = 0; i < 88; i++) {
                     vec3 p = ro + rd * travel;
-                    float d = waterDistance(p, g);
+                    float d = waterDistance(p, up);
                     if (d < 0.0018) { hit = p; return true; }
                     travel += max(d * 0.72, 0.0015);
                     if (travel > 7.0) break;
@@ -523,10 +523,10 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val time = (now - startNanos) / 1_000_000_000f
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glUseProgram(program)
+        val up = computeUp(springGravityX, springGravityY, springGravityZ)
         GLES30.glUniform1f(timeHandle, time)
         GLES30.glUniform3f(upHandle, up[0], up[1], up[2])
         GLES30.glUniform1f(shakeHandle, shake)
-        val up = computeUp(springGravityX, springGravityY, springGravityZ)
         val rawSurfaceOffset = volumeSolver.offsetForHalfFill(up[0], up[1], up[2])
         if (rawSurfaceOffset.isFinite()) {
             lastGoodSurfaceOffset = rawSurfaceOffset.coerceIn(-1.5f, 1.5f)
