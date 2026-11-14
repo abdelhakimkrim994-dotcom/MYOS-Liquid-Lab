@@ -417,6 +417,44 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
 
                     color = mix(body, top, surfaceFactor);
 
+                    // When the camera looks almost along the surface normal (phone
+                    // face-up), the visible hit is the water/air interface. Shade the
+                    // liquid as a transparent volume so the far glass remains visible.
+                    // The ordinary side-on path below remains unchanged for upright use.
+                    float viewAlignment = dot(up, viewDir);
+                    if (viewAlignment > 0.82) {
+                        vec3 innerHalf = TANK - vec3(0.018);
+                        vec3 safeRd = mix(vec3(0.0001), rd, greaterThan(abs(rd), vec3(0.0001)));
+                        vec3 tToWall = vec3(
+                            rd.x > 0.0 ? ( innerHalf.x - hit.x) / safeRd.x : (-innerHalf.x - hit.x) / safeRd.x,
+                            rd.y > 0.0 ? ( innerHalf.y - hit.y) / safeRd.y : (-innerHalf.y - hit.y) / safeRd.y,
+                            rd.z > 0.0 ? ( innerHalf.z - hit.z) / safeRd.z : (-innerHalf.z - hit.z) / safeRd.z
+                        );
+                        float tx = rd.x == 0.0 ? 1e4 : tToWall.x;
+                        float ty = rd.y == 0.0 ? 1e4 : tToWall.y;
+                        float tz = rd.z == 0.0 ? 1e4 : tToWall.z;
+                        float exitT = min(tx, min(ty, tz));
+                        if (exitT > 0.0 && exitT < 2.0) {
+                            vec3 backPoint = hit + rd * exitT;
+                            vec3 backNormal = tx <= ty && tx <= tz ? vec3(sign(rd.x),0.0,0.0)
+                                              : (ty <= tz ? vec3(0.0,sign(rd.y),0.0)
+                                                          : vec3(0.0,0.0,sign(rd.z)));
+                            float backCaustics = triCaustics(backPoint, backNormal);
+                            float backBubbles = bubbles(backPoint.xy, uTime * 0.72);
+                            vec3 backGlass = vec3(0.025, 0.105, 0.16);
+                            backGlass += vec3(0.10, 0.39, 0.39) * backCaustics * 0.72;
+                            backGlass += vec3(0.48, 0.82, 0.78) * backBubbles * 0.34;
+
+                            // Wavelength-dependent absorption gives the shallow layer
+                            // turquoise color while retaining detail on the far glass.
+                            vec3 transmittance = exp(-vec3(1.10, 0.48, 0.30) * exitT);
+                            vec3 transmitted = backGlass * transmittance
+                                             + vec3(0.035, 0.22, 0.23) * (1.0 - transmittance);
+                            float fresnel = 0.02 + 0.12 * pow(1.0 - clamp(dot(n, viewDir), 0.0, 1.0), 5.0);
+                            color = mix(transmitted, top, fresnel);
+                        }
+                    }
+
                     // Thin warm-ivory meniscus where the water meets the glass.
                     float foam = 1.0 - smoothstep(0.006, 0.026, abs(s));
                     float sideFace = 1.0 - surfaceFactor;
