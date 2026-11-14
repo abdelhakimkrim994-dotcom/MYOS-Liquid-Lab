@@ -347,6 +347,29 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 vec2 q = abs(p) - b + r;
                 return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
             }
+            float boxEdges(vec3 ro, vec3 rd) {
+                vec3 safeRd = vec3(
+                    abs(rd.x) < 0.00001 ? (rd.x < 0.0 ? -0.00001 : 0.00001) : rd.x,
+                    abs(rd.y) < 0.00001 ? (rd.y < 0.0 ? -0.00001 : 0.00001) : rd.y,
+                    abs(rd.z) < 0.00001 ? (rd.z < 0.0 ? -0.00001 : 0.00001) : rd.z
+                );
+                vec3 a = (-TANK - ro) / safeRd;
+                vec3 b = ( TANK - ro) / safeRd;
+                vec3 lo = min(a, b);
+                vec3 hi = max(a, b);
+                float tNear = max(lo.x, max(lo.y, lo.z));
+                float tFar = min(hi.x, min(hi.y, hi.z));
+                if (tFar < max(tNear, 0.0)) return 0.0;
+                vec3 p = ro + rd * max(tNear, 0.0);
+                float edgeDistance;
+                if (lo.x >= lo.y && lo.x >= lo.z)
+                    edgeDistance = min(abs(abs(p.y) - TANK.y), abs(abs(p.z) - TANK.z));
+                else if (lo.y >= lo.z)
+                    edgeDistance = min(abs(abs(p.x) - TANK.x), abs(abs(p.z) - TANK.z));
+                else
+                    edgeDistance = min(abs(abs(p.x) - TANK.x), abs(abs(p.y) - TANK.y));
+                return 1.0 - smoothstep(0.002, 0.018, edgeDistance);
+            }
             vec3 surfaceNormal(vec3 p, vec3 up) {
                 vec3 n = normalize(up);
                 float w = 0.010 * sin(p.x * 13.0 + uTime * 1.7)
@@ -508,6 +531,9 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                     color = mix(color, vec3(0.83, 0.91, 0.78),
                                 foam * 0.62 * sideFace);
                 }
+
+                float perspectiveEdges = boxEdges(ro, rd);
+                color += vec3(0.20, 0.49, 0.57) * perspectiveEdges * 0.48;
 
                 // Front glass is evaluated on its actual plane, not a constant
                 // ray-distance slice (which curved the tank during parallax).
