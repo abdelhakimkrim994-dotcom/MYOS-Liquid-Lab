@@ -132,6 +132,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     private var program = 0
     private var timeHandle = 0
     private var upHandle = 0
+    private var eyeHandle = 0
     private var resolutionHandle = 0
     private var shakeHandle = 0
     private var surfaceOffsetHandle = 0
@@ -140,6 +141,12 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     private val upSignX = -1f
     private val upSignZ = 1f
     private val computedUp = FloatArray(3)
+    private var neutralGravityX = 0f
+    private var neutralGravityZ = 0f
+    @Volatile private var eyeX = 0f
+    @Volatile private var eyeY = 0f
+    private var eyeFilterInitialized = false
+    private var lastEyeTimestamp = 0L
     private var frameCounter = 0L
     private var lastDiagnosticsNanos = 0L
     private var startNanos = 0L
@@ -154,6 +161,26 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         rawSensorX = rawX
         rawSensorY = rawY
         rawSensorZ = rawZ
+        // Slow neutral tracking prevents long-term sensor bias from moving the camera.
+        // A separate 100 ms eye filter keeps parallax responsive without adding lag
+        // to the gravity vector used by the water volume.
+        if (!eyeFilterInitialized) {
+            neutralGravityX = x
+            neutralGravityZ = z
+            lastEyeTimestamp = timestampNanos
+            eyeFilterInitialized = true
+        } else {
+            val eyeDt = ((timestampNanos - lastEyeTimestamp) / 1_000_000_000f).coerceIn(0.001f, 0.1f)
+            lastEyeTimestamp = timestampNanos
+            val neutralAlpha = 1f - kotlin.math.exp(-eyeDt / 4f)
+            neutralGravityX += (x - neutralGravityX) * neutralAlpha
+            neutralGravityZ += (z - neutralGravityZ) * neutralAlpha
+            val targetEyeX = ((x - neutralGravityX) / 0.35f).coerceIn(-1f, 1f)
+            val targetEyeY = (-(z - neutralGravityZ) / 0.35f).coerceIn(-1f, 1f)
+            val eyeAlpha = 1f - kotlin.math.exp(-eyeDt / 0.10f)
+            eyeX += (targetEyeX - eyeX) * eyeAlpha
+            eyeY += (targetEyeY - eyeY) * eyeAlpha
+        }
         val magnitude = kotlin.math.sqrt(x * x + y * y + z * z)
         if (!magnitude.isFinite() || magnitude < 0.35f) return
         val rx = x / magnitude
@@ -255,6 +282,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
             out vec4 fragColor;
             uniform vec2 uResolution;
             uniform vec3 uUp;
+            uniform vec2 uEye;
             uniform float uTime;
             uniform float uShake;
             uniform float uSurfaceOffset;
@@ -315,6 +343,33 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 vec3 q = abs(p) - b + r;
                 return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
             }
+            float sdRoundRect(vec2 p, vec2 b, float r) {
+                vec2 q = abs(p) - b + r;
+                return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+            }
+            float boxEdges(vec3 ro, vec3 rd) {
+                vec3 safeRd = vec3(
+                    abs(rd.x) < 0.00001 ? (rd.x < 0.0 ? -0.00001 : 0.00001) : rd.x,
+                    abs(rd.y) < 0.00001 ? (rd.y < 0.0 ? -0.00001 : 0.00001) : rd.y,
+                    abs(rd.z) < 0.00001 ? (rd.z < 0.0 ? -0.00001 : 0.00001) : rd.z
+                );
+                vec3 a = (-TANK - ro) / safeRd;
+                vec3 b = ( TANK - ro) / safeRd;
+                vec3 lo = min(a, b);
+                vec3 hi = max(a, b);
+                float tNear = max(lo.x, max(lo.y, lo.z));
+                float tFar = min(hi.x, min(hi.y, hi.z));
+                if (tFar < max(tNear, 0.0)) return 0.0;
+                vec3 p = ro + rd * max(tNear, 0.0);
+                float edgeDistance;
+                if (lo.x >= lo.y && lo.x >= lo.z)
+                    edgeDistance = min(abs(abs(p.y) - TANK.y), abs(abs(p.z) - TANK.z));
+                else if (lo.y >= lo.z)
+                    edgeDistance = min(abs(abs(p.x) - TANK.x), abs(abs(p.z) - TANK.z));
+                else
+                    edgeDistance = min(abs(abs(p.x) - TANK.x), abs(abs(p.y) - TANK.y));
+                return 1.0 - smoothstep(0.002, 0.018, edgeDistance);
+            }
             vec3 surfaceNormal(vec3 p, vec3 up) {
                 vec3 n = normalize(up);
                 float w = 0.010 * sin(p.x * 13.0 + uTime * 1.7)
@@ -361,10 +416,29 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 vec2 uv = vUv;
                 float aspect = uResolution.x / uResolution.y;
                 vec2 screen = (uv - 0.5) * vec2(aspect, 1.0);
-                vec3 ro = vec3(0.0, 0.0, 3.35);
-                vec3 rd = normalize(vec3(screen * 1.48, -1.85));
+                // Anchor the camera to the physical front-glass plane. The scale
+                // preserves the original 0.3.7 framing at z=+0.305.
+                vec2 win = screen * 2.436;
+                vec2 eye = clamp(uEye, vec2(-1.0), vec2(1.0)) * vec2(0.20, 0.26);
+                vec3 ro = vec3(eye, 3.35);
+                vec3 rd = normalize(vec3(win - eye, TANK.z - 3.35));
                 vec3 up = normalize(uUp);
                 vec3 background = vec3(0.009, 0.025, 0.038);
+                float inRect = 1.0 - smoothstep(0.0, 0.012,
+                    sdRoundRect(win, TANK.xy, 0.055));
+                // The backdrop is a real plane behind the tank. Guard both ray
+                // directions so refracted rays with positive Z never divide by zero.
+                float backdropDenom = abs(rd.z) < 0.001
+                    ? (rd.z < 0.0 ? -0.001 : 0.001) : rd.z;
+                float backdropZ = rd.z < 0.0 ? -0.80 : 0.80;
+                float backdropT = (backdropZ - ro.z) / backdropDenom;
+                vec3 backdropPoint = ro + rd * max(backdropT, 0.0);
+                float gridFine = 1.0 - smoothstep(0.04, 0.10,
+                    min(abs(fract(backdropPoint.x * 5.0) - 0.5),
+                        abs(fract(backdropPoint.y * 5.0) - 0.5)));
+                vec3 backdropColor = vec3(0.010, 0.031, 0.043) +
+                    vec3(0.012, 0.036, 0.043) * gridFine * 0.22;
+                background = mix(background, backdropColor, inRect * 0.72);
                 // Keep the background uniform: the old radial halo looked like a
                 // persistent glowing blob trapped in the center of the water.
 
@@ -417,41 +491,6 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
 
                     color = mix(body, top, surfaceFactor);
 
-                    // When the camera looks almost along the surface normal (phone
-                    // face-up), the visible hit is the water/air interface. Shade the
-                    // liquid as a transparent volume so the far glass remains visible.
-                    // The ordinary side-on path below remains unchanged for upright use.
-                    float viewAlignment = dot(up, viewDir);
-                    if (viewAlignment > 0.82) {
-                        vec3 innerHalf = TANK - vec3(0.018);
-                        float tx = abs(rd.x) < 0.0001 ? 1e4 :
-                            (rd.x > 0.0 ? (innerHalf.x - hit.x) / rd.x : (-innerHalf.x - hit.x) / rd.x);
-                        float ty = abs(rd.y) < 0.0001 ? 1e4 :
-                            (rd.y > 0.0 ? (innerHalf.y - hit.y) / rd.y : (-innerHalf.y - hit.y) / rd.y);
-                        float tz = abs(rd.z) < 0.0001 ? 1e4 :
-                            (rd.z > 0.0 ? (innerHalf.z - hit.z) / rd.z : (-innerHalf.z - hit.z) / rd.z);
-                        float exitT = min(tx, min(ty, tz));
-                        if (exitT > 0.0 && exitT < 2.0) {
-                            vec3 backPoint = hit + rd * exitT;
-                            vec3 backNormal = tx <= ty && tx <= tz ? vec3(sign(rd.x),0.0,0.0)
-                                              : (ty <= tz ? vec3(0.0,sign(rd.y),0.0)
-                                                          : vec3(0.0,0.0,sign(rd.z)));
-                            float backCaustics = triCaustics(backPoint, backNormal);
-                            float backBubbles = bubbles(backPoint.xy, uTime * 0.72);
-                            vec3 backGlass = vec3(0.025, 0.105, 0.16);
-                            backGlass += vec3(0.10, 0.39, 0.39) * backCaustics * 0.72;
-                            backGlass += vec3(0.48, 0.82, 0.78) * backBubbles * 0.34;
-
-                            // Wavelength-dependent absorption gives the shallow layer
-                            // turquoise color while retaining detail on the far glass.
-                            vec3 transmittance = exp(-vec3(1.10, 0.48, 0.30) * exitT);
-                            vec3 transmitted = backGlass * transmittance
-                                             + vec3(0.035, 0.22, 0.23) * (1.0 - transmittance);
-                            float fresnel = 0.02 + 0.12 * pow(1.0 - clamp(dot(n, viewDir), 0.0, 1.0), 5.0);
-                            color = mix(transmitted, top, fresnel);
-                        }
-                    }
-
                     // Thin warm-ivory meniscus where the water meets the glass.
                     float foam = 1.0 - smoothstep(0.006, 0.026, abs(s));
                     float sideFace = 1.0 - surfaceFactor;
@@ -459,19 +498,27 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                                 foam * 0.62 * sideFace);
                 }
 
-                // Glass vessel: rounded silhouette, bright polished edges and front-face reflections.
-                vec3 pNear = ro + rd * 3.05;
-                float shell = abs(sdRoundBox(pNear, TANK, 0.055));
-                float edge = 1.0 - smoothstep(0.002,0.013,shell);
-                float rim = 1.0 - smoothstep(0.018,0.045,shell);
+                float perspectiveEdges = boxEdges(ro, rd);
+                color += vec3(0.20, 0.49, 0.57) * perspectiveEdges * 0.48;
+
+                // Front glass is evaluated on its actual plane, not a constant
+                // ray-distance slice (which curved the tank during parallax).
+                float frontT = (TANK.z - ro.z) / rd.z;
+                vec3 pNear = ro + rd * frontT;
+                float shell = abs(sdRoundRect(pNear.xy, TANK.xy, 0.055));
+                float edge = (1.0 - smoothstep(0.002, 0.013, shell)) * inRect;
+                float rim = (1.0 - smoothstep(0.018, 0.045, shell)) * inRect;
                 color += vec3(0.27,0.64,0.72) * edge * 0.72;
                 color += vec3(0.10,0.27,0.32) * rim * 0.20;
-                float leftStrip = exp(-pow((pNear.x + 0.365)*45.0,2.0)) * smoothstep(-0.82,0.72,pNear.y);
-                float rightStrip = exp(-pow((pNear.x - 0.37)*54.0,2.0)) * smoothstep(-0.78,0.78,pNear.y);
+                float leftStrip = exp(-pow((pNear.x + 0.365)*45.0,2.0)) *
+                                  smoothstep(-0.82,0.72,pNear.y) * inRect;
+                float rightStrip = exp(-pow((pNear.x - 0.37)*54.0,2.0)) *
+                                   smoothstep(-0.78,0.78,pNear.y) * inRect;
                 color += vec3(0.42,0.72,0.78) * (leftStrip*0.24 + rightStrip*0.12);
-                float topGlare = exp(-pow((pNear.y - 0.85)*38.0,2.0)) * smoothstep(-0.34,0.34,pNear.x);
+                float topGlare = exp(-pow((pNear.y - 0.85)*38.0,2.0)) *
+                                 smoothstep(-0.34,0.34,pNear.x) * inRect;
                 color += vec3(0.52,0.78,0.82) * topGlare * 0.25;
-                float vignette = smoothstep(1.05,0.25,length(screen*vec2(0.85,0.72)));
+                float vignette = 1.0 - smoothstep(0.25, 1.05, length(screen*vec2(0.85,0.72)));
                 color *= 0.72 + 0.28*vignette;
                 // Gentle exponential tone mapping keeps highlights bright without clipping.
                 color = 1.0 - exp(-max(color, vec3(0.0)) * 1.35);
@@ -485,6 +532,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         program = linkProgram(vertex, fragment)
         timeHandle = GLES30.glGetUniformLocation(program, "uTime")
         upHandle = GLES30.glGetUniformLocation(program, "uUp")
+        eyeHandle = GLES30.glGetUniformLocation(program, "uEye")
         resolutionHandle = GLES30.glGetUniformLocation(program, "uResolution")
         shakeHandle = GLES30.glGetUniformLocation(program, "uShake")
         surfaceOffsetHandle = GLES30.glGetUniformLocation(program, "uSurfaceOffset")
@@ -561,6 +609,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val up = computeUp(springGravityX, springGravityY, springGravityZ)
         GLES30.glUniform1f(timeHandle, time)
         GLES30.glUniform3f(upHandle, up[0], up[1], up[2])
+        GLES30.glUniform2f(eyeHandle, eyeX, eyeY)
         GLES30.glUniform1f(shakeHandle, shake)
         val rawSurfaceOffset = volumeSolver.offsetForHalfFill(up[0], up[1], up[2])
         if (rawSurfaceOffset.isFinite()) {
@@ -601,7 +650,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         // Stage 0 device test confirmed the face-up Z direction is inverted with -1.
         // Keep X unchanged; flip only Z so the solver and shader share the corrected up vector.
         val x = upSignX * gx
-        val y = max(0.16f, abs(gy))
+        val y = gy
         val z = upSignZ * gz
         val length = kotlin.math.sqrt(x * x + y * y + z * z).coerceAtLeast(0.0001f)
         computedUp[0] = x / length
