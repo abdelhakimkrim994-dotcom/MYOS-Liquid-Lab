@@ -290,6 +290,44 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                      + causticPattern(p.xz) * w.y
                      + causticPattern(p.xy) * w.z;
             }
+            // Build a stable 2D coordinate frame tangent to the gravity-aligned
+            // free surface. The existing height field is now sampled in this frame,
+            // so its displacement follows the liquid plane as the device rotates.
+            vec2 fluidUvAt(vec3 p, vec3 up, out vec3 tangentX, out vec3 tangentZ,
+                           out float extentX, out float extentZ) {
+                vec3 reference = abs(up.y) < 0.90 ? vec3(0.0, 1.0, 0.0)
+                                                  : vec3(0.0, 0.0, 1.0);
+                tangentX = normalize(cross(reference, up));
+                tangentZ = normalize(cross(up, tangentX));
+                extentX = max(dot(abs(tangentX), TANK), 0.05);
+                extentZ = max(dot(abs(tangentZ), TANK), 0.05);
+                return clamp(vec2(dot(p, tangentX) / (2.0 * extentX) + 0.5,
+                                  dot(p, tangentZ) / (2.0 * extentZ) + 0.5),
+                             vec2(0.001), vec2(0.999));
+            }
+            float fluidHeightAt(vec3 p, vec3 up) {
+                vec3 tangentX;
+                vec3 tangentZ;
+                float extentX;
+                float extentZ;
+                vec2 uv = fluidUvAt(p, up, tangentX, tangentZ, extentX, extentZ);
+                return texture(uFluidHeight, uv).r;
+            }
+            vec3 fluidSurfaceNormalAt(vec3 p, vec3 up) {
+                vec3 tangentX;
+                vec3 tangentZ;
+                float extentX;
+                float extentZ;
+                vec2 uv = fluidUvAt(p, up, tangentX, tangentZ, extentX, extentZ);
+                vec2 texel = 1.0 / vec2(textureSize(uFluidHeight, 0));
+                float leftH = texture(uFluidHeight, uv - vec2(texel.x, 0.0)).r;
+                float rightH = texture(uFluidHeight, uv + vec2(texel.x, 0.0)).r;
+                float downH = texture(uFluidHeight, uv - vec2(0.0, texel.y)).r;
+                float upH = texture(uFluidHeight, uv + vec2(0.0, texel.y)).r;
+                float gradX = (rightH - leftH) / max(4.0 * texel.x * extentX, 0.0001);
+                float gradZ = (upH - downH) / max(4.0 * texel.y * extentZ, 0.0001);
+                return normalize(up - tangentX * gradX - tangentZ * gradZ);
+            }
             float bubbles(vec2 p, float t) {
                 float acc = 0.0;
                 for (int i = 0; i < 3; i++) {
@@ -415,24 +453,33 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                     bool entersAtSurface = false;
                     bool exitsAtSurface = false;
 
-                    // Water occupies dot(position, up) + offset <= 0.
+                    // The simulated height field displaces the free surface along
+                    // the gravity normal. Correct the analytic plane crossing with the
+                    // sampled local height, then derive a matching perturbed normal.
                     float planeOrigin = dot(ro, up) + uSurfaceOffset;
                     float planeDirection = dot(rd, up);
                     bool validWaterInterval = true;
                     if (abs(planeDirection) < 0.00001) {
-                        validWaterInterval = planeOrigin <= 0.0;
+                        vec3 probe = ro + rd * enterT;
+                        validWaterInterval = planeOrigin + dot(rd * enterT, up) -
+                                             fluidHeightAt(probe, up) <= 0.0;
                     } else {
-                        float surfaceT = -planeOrigin / planeDirection;
+                        float baseSurfaceT = -planeOrigin / planeDirection;
+                        vec3 baseSurfacePoint = ro + rd * baseSurfaceT;
+                        float localSurfaceHeight = fluidHeightAt(baseSurfacePoint, up);
+                        float surfaceT = baseSurfaceT + localSurfaceHeight / planeDirection;
+                        vec3 localSurfacePoint = ro + rd * surfaceT;
+                        vec3 localSurfaceNormal = fluidSurfaceNormalAt(localSurfacePoint, up);
                         if (planeDirection > 0.0) {
                             if (surfaceT < exitT) {
                                 exitT = surfaceT;
-                                exitNormal = up;
+                                exitNormal = localSurfaceNormal;
                                 exitsAtSurface = true;
                             }
                         } else {
                             if (surfaceT > enterT) {
                                 enterT = surfaceT;
-                                enterNormal = up;
+                                enterNormal = localSurfaceNormal;
                                 entersAtSurface = true;
                             }
                         }
