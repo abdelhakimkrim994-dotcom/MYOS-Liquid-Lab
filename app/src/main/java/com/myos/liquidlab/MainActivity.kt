@@ -412,6 +412,50 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 hit = vec3(0.0);
                 return false;
             }
+            // Axis-aligned inner-box exit. Parallel axes contribute infinity,
+            // never a fabricated near-zero exit. Corner ties choose one stable face.
+            float exitBox(vec3 p, vec3 r, vec3 wb, out vec3 nOut) {
+                float tx = r.x > 0.00001 ? ( wb.x - p.x) / r.x :
+                           r.x < -0.00001 ? (-wb.x - p.x) / r.x : 1e9;
+                float ty = r.y > 0.00001 ? ( wb.y - p.y) / r.y :
+                           r.y < -0.00001 ? (-wb.y - p.y) / r.y : 1e9;
+                float tz = r.z > 0.00001 ? ( wb.z - p.z) / r.z :
+                           r.z < -0.00001 ? (-wb.z - p.z) / r.z : 1e9;
+                float t = min(tx, min(ty, tz));
+                if (tx <= ty && tx <= tz) nOut = vec3(sign(r.x), 0.0, 0.0);
+                else if (ty <= tz) nOut = vec3(0.0, sign(r.y), 0.0);
+                else nOut = vec3(0.0, 0.0, sign(r.z));
+                return max(t, 0.0);
+            }
+            float exitWater(vec3 p, vec3 r, vec3 up, float surfaceOffset,
+                            vec3 wb, out vec3 nOut, out float viaSurface) {
+                vec3 boxNormal;
+                float tBox = exitBox(p, r, wb, boxNormal);
+                float ds = dot(r, up);
+                float tSurface = ds > 0.0001
+                    ? max(-(dot(p, up) + surfaceOffset) / ds, 0.0) : 1e9;
+                if (tSurface < tBox) {
+                    nOut = normalize(up);
+                    viaSurface = 1.0;
+                    return tSurface;
+                }
+                nOut = normalize(boxNormal);
+                viaSurface = 0.0;
+                return tBox;
+            }
+            vec3 sampleBackdrop(vec3 p, vec3 r) {
+                // Select the far plane in the ray's travel direction. This explicitly
+                // handles positive-Z rays instead of clamping them to the rear plane.
+                float planeZ = r.z < 0.0 ? -0.80 : 0.80;
+                if (abs(r.z) < 0.0001) return vec3(0.008, 0.022, 0.030);
+                float t = max((planeZ - p.z) / r.z, 0.0);
+                vec3 q = p + r * t;
+                float gx = abs(fract(q.x * 5.0) - 0.5);
+                float gy = abs(fract(q.y * 5.0) - 0.5);
+                float grid = 1.0 - smoothstep(0.04, 0.10, min(gx, gy));
+                return vec3(0.010, 0.031, 0.043) +
+                       vec3(0.012, 0.036, 0.043) * grid * 0.22;
+            }
             void main() {
                 vec2 uv = vUv;
                 float aspect = uResolution.x / uResolution.y;
@@ -489,6 +533,79 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                     top += vec3(0.72, 0.88, 0.76) * glint * 0.34;
 
                     color = mix(body, top, surfaceFactor);
+
+                    // Two-interface optical transport through the actual water path.
+                    // The inner box is a conservative analytic approximation of the
+                    // rounded tank; every start is checked before slab exits are used.
+                    vec3 entryNormal = normalize(n);
+                    if (dot(rd, entryNormal) > 0.0) entryNormal = -entryNormal;
+                    vec3 rayInside = refract(rd, entryNormal, 1.0 / 1.33);
+                    if (dot(rayInside, rayInside) > 0.000001) {
+                        vec3 wb = TANK - vec3(0.018);
+                        vec3 insidePoint = hit + rayInside * 0.004;
+                        bool insideStart = sdRoundBox(insidePoint, wb, 0.0) < -0.0005 &&
+                                           dot(insidePoint, up) + uSurfaceOffset < 0.0;
+                        if (insideStart) {
+                            float totalWaterLength = 0.0;
+                            vec3 exitPoint = insidePoint;
+                            vec3 exitNormal = up;
+                            vec3 rayOutside = vec3(0.0);
+                            bool escaped = false;
+
+                            // At most one internal-reflection retry. A second TIR
+                            // deliberately falls back to an absorbed internal tint;
+                            // it must never sample the backdrop from inside the water.
+                            for (int bounce = 0; bounce < 2; bounce++) {
+                                float viaSurface;
+                                vec3 candidateNormal;
+                                float segmentLength = exitWater(insidePoint, rayInside, up,
+                                    uSurfaceOffset, wb, candidateNormal, viaSurface);
+                                if (segmentLength >= 1e8) break;
+                                segmentLength = max(segmentLength, 0.0);
+                                totalWaterLength += segmentLength;
+                                exitPoint = insidePoint + rayInside * segmentLength;
+                                exitNormal = normalize(candidateNormal);
+                                rayOutside = refract(rayInside, -exitNormal, 1.33);
+                                if (dot(rayOutside, rayOutside) > 0.000001) {
+                                    escaped = true;
+                                    break;
+                                }
+                                if (bounce == 1) break;
+                                rayInside = reflect(rayInside, exitNormal);
+                                insidePoint = exitPoint - exitNormal * 0.004 + rayInside * 0.002;
+                                insideStart = sdRoundBox(insidePoint, wb, 0.0) < -0.0005 &&
+                                              dot(insidePoint, up) + uSurfaceOffset < 0.0;
+                                if (!insideStart) break;
+                            }
+
+                            vec3 absorption = vec3(1.10, 0.48, 0.30);
+                            vec3 transmittance = exp(-absorption * totalWaterLength);
+                            if (escaped) {
+                                vec3 farGlass = sampleBackdrop(exitPoint + rayOutside * 0.003,
+                                                                normalize(rayOutside));
+                                float causticLight = triCaustics(exitPoint, exitNormal);
+                                float bubbleLight = bubbles(exitPoint.xy, uTime * 0.72);
+                                farGlass += vec3(0.10, 0.39, 0.39) * causticLight * 0.55;
+                                farGlass += vec3(0.48, 0.82, 0.78) * bubbleLight * 0.28;
+                                vec3 inScatter = vec3(0.018, 0.105, 0.115) *
+                                                 (1.0 - transmittance);
+                                vec3 transmitted = farGlass * transmittance + inScatter;
+
+                                vec3 reflectedRay = reflect(rd, entryNormal);
+                                vec3 reflected = sampleBackdrop(hit + entryNormal * 0.004,
+                                                                 reflectedRay);
+                                float cosEntry = clamp(-dot(rd, entryNormal), 0.0, 1.0);
+                                float cosExit = clamp(dot(rayInside, exitNormal), 0.0, 1.0);
+                                float fEntry = 0.0204 + 0.9796 * pow(1.0 - cosEntry, 5.0);
+                                float fExit = 0.0204 + 0.9796 * pow(1.0 - cosExit, 5.0);
+                                float fresnel = 1.0 - (1.0 - fEntry) * (1.0 - fExit);
+                                color = mix(transmitted, reflected, clamp(fresnel, 0.0, 0.45));
+                            } else {
+                                color = vec3(0.012, 0.055, 0.072) * transmittance +
+                                        vec3(0.006, 0.022, 0.030);
+                            }
+                        }
+                    }
 
                     // Thin warm-ivory meniscus where the water meets the glass.
                     float foam = 1.0 - smoothstep(0.006, 0.026, abs(s));
