@@ -9,7 +9,7 @@ A standalone Android playground for a convincing 3D water volume with gravity-dr
 - No launcher, wallpaper, app icons, weather, or time-dependent artwork.
 - Fish are a later optional layer. No floating props in the first prototype.
 
-## Iteration
+## Current prototype\nVersion 0.2.0 introduces a ray-marched 3D liquid volume inside a rounded vessel, with gravity-oriented free-surface geometry, depth-dependent body shading, specular response, glass edge highlights and shake-driven surface disturbance. It remains an experimental real-time approximation rather than a full computational fluid dynamics solver.\n\n## Iteration
 Appearance comes first. Each build should isolate a small set of visual and physics changes so screenshots and device tests can guide the next pass.
 
 ## Build
