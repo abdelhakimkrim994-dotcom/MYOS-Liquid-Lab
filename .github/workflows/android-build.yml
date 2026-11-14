@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main, "stage0/**", "stage1/**", "stage2/**"]
   push:
-    branches: [main, "stage0/**", "stage1/**"]
+    branches: [main, "stage0/**", "stage1/**", "stage2/**"]
   workflow_dispatch:
 
 permissions:
