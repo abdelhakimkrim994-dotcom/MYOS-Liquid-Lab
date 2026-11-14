@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main, "stage0/**"]
+    branches: [main, "stage0/**", "stage1/**"]
   workflow_dispatch:
 
 permissions:
@@ -27,6 +27,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: MYOS-Liquid-Lab-0.3.8-stage0
+          name: MYOS-Liquid-Lab-0.4.0-stage1
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
