@@ -202,8 +202,8 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
                 vec3 rd = normalize(vec3(screen * 1.48, -1.85));
                 vec3 g = normalize(uGravity);
                 vec3 background = vec3(0.009, 0.025, 0.038);
-                float halo = exp(-length(screen * vec2(1.1,0.85)) * 3.0);
-                background += vec3(0.015,0.075,0.092) * halo;
+                // Keep the background uniform: the old radial halo looked like a
+                // persistent glowing blob trapped in the center of the water.
 
                 // Ray-marched intersection of a real 3D liquid volume with its container.
                 vec3 hit;
