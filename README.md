@@ -9,12 +9,12 @@ A standalone Android playground for a convincing 3D water volume with gravity-dr
 - No launcher, wallpaper, app icons, weather, or time-dependent artwork.
 - Fish are a later optional layer. No floating props in the first prototype.
 
-## Current prototype — 0.3.0
+## Current prototype — 0.3.2
 Version 0.3.0 introduces a separate `FluidSurfaceSimulation` physics layer. It evolves a low-resolution 2D shallow-water field (surface height plus horizontal velocity) with continuity, pressure-gradient response, damping and reflecting vessel boundaries. Accelerometer motion injects momentum into the field.
 
-The ray-marched 3D renderer remains the visual baseline. It samples the simulated height field as a texture to deform the liquid free surface. The existing inertial tilt response remains in place, so the surface combines the large-scale gravity orientation with locally simulated sloshing.
+The ray-marched 3D renderer remains the visual baseline. It samples the simulated height field as a texture to deform the liquid free surface. A separate deterministic volume solver uses bisection over a precomputed rounded-container point cloud to find the plane offset for a 50% fill target at each orientation. The simulated surface field is mean-corrected, so local waves do not accumulate a net volume offset. The existing inertial tilt response remains in place.
 
-This is an intentionally lightweight first step toward fluid dynamics, not a full 3D Navier–Stokes, PBF or MLS-MPM solver. It does not yet simulate a fully deformable 3D volume or physically correct glass refraction. The 40×40 CPU grid is a prototype tradeoff; performance and visual response must be checked on a physical Android device.
+This is an intentionally lightweight first step toward fluid dynamics, not a full 3D Navier–Stokes, PBF or MLS-MPM solver. It does not yet simulate a fully deformable 3D volume or physically correct glass refraction. The surface remains a gravity-aligned plane plus local height-field deformation; extreme orientations are still an approximation of corner pooling. The 40×40 CPU grid is a prototype tradeoff; performance and visual response must be checked on a physical Android device.
 
 ## Research references
 - [Lagrangian Fluid Simulation for Android](https://github.com/MartinOpat/Lagrangian-fluid-simulation-for-Android) — native Android/C++ particle simulation architecture.
