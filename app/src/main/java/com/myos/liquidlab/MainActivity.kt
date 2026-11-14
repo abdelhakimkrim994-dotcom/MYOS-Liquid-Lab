@@ -138,7 +138,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     private val volumeSolver = SurfaceVolumeSolver()
     private var lastGoodSurfaceOffset = 0f
     private val upSignX = -1f
-    private val upSignZ = -1f
+    private val upSignZ = 1f
     private val computedUp = FloatArray(3)
     private var frameCounter = 0L
     private var lastDiagnosticsNanos = 0L
@@ -563,8 +563,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     }
 
     private fun computeUp(gx: Float, gy: Float, gz: Float): FloatArray {
-        // Stage 0 deliberately preserves the 0.3.7 shader convention for device diagnosis.
-        // Change the Z sign only after the face-up / pitch tests confirm the physical direction.
+        // Stage 0 device test confirmed the face-up Z direction is inverted with -1.
+        // Keep X unchanged; flip only Z so the solver and shader share the corrected up vector.
         val x = upSignX * gx
         val y = max(0.16f, abs(gy))
         val z = upSignZ * gz
