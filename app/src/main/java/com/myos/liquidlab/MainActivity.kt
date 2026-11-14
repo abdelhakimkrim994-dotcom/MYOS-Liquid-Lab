@@ -362,7 +362,11 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
             bool rayBox(vec3 ro, vec3 rd, vec3 halfSize,
                         out float tNear, out float tFar,
                         out vec3 nearNormal, out vec3 farNormal) {
-                vec3 safeRd = sign(rd) * max(abs(rd), vec3(0.000001));
+                vec3 safeRd = vec3(
+                    abs(rd.x) < 0.000001 ? (rd.x < 0.0 ? -0.000001 : 0.000001) : rd.x,
+                    abs(rd.y) < 0.000001 ? (rd.y < 0.0 ? -0.000001 : 0.000001) : rd.y,
+                    abs(rd.z) < 0.000001 ? (rd.z < 0.0 ? -0.000001 : 0.000001) : rd.z
+                );
                 vec3 invRd = 1.0 / safeRd;
                 vec3 a = (-halfSize - ro) * invRd;
                 vec3 b = ( halfSize - ro) * invRd;
