@@ -176,6 +176,14 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                            mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
                                mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
             }
+            float causticPattern(vec3 p) {
+                vec2 q = p.xz * vec2(8.5, 10.5);
+                q += vec2(sin(p.z * 5.0 + uTime * 0.55),
+                          cos(p.x * 4.0 - uTime * 0.48)) * 0.24;
+                float a = sin(q.x * 1.65 + sin(q.y * 1.25 + uTime * 0.82));
+                float b = sin(q.y * 1.85 - sin(q.x * 1.35 - uTime * 0.68));
+                return pow(clamp(1.0 - abs(a * b), 0.0, 1.0), 8.0);
+            }
             float sdRoundBox(vec3 p, vec3 b, float r) {
                 vec3 q = abs(p) - b + r;
                 return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
@@ -243,15 +251,25 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                     vec3 lightDir = normalize(vec3(-0.45, 0.78, 0.62));
                     float fresnel = pow(1.0 - max(dot(n, viewDir), 0.0), 4.0);
                     float diffuse = max(dot(n, lightDir), 0.0);
-                    float thickness = clamp((hit.y + TANK.y) / (2.0 * TANK.y), 0.0, 1.0);
-                    vec3 deep = vec3(0.004, 0.075, 0.105);
-                    vec3 body = mix(vec3(0.012,0.27,0.34), deep, 0.35 + thickness * 0.48);
-                    float spec = pow(max(dot(reflect(-lightDir,n),viewDir),0.0), 72.0);
-                    float surfaceFactor = smoothstep(0.72,0.96,n.y);
-                    vec3 surfaceColor = vec3(0.025,0.38,0.43) + vec3(0.30,0.48,0.45)*diffuse;
-                    surfaceColor += vec3(0.72,0.92,0.92)*(spec*0.72 + fresnel*0.34);
+                    float depth = clamp((hit.y + TANK.y) / (2.0 * TANK.y), 0.0, 1.0);
+                    // Saturated, layered colour gives the water a playful 3D glass-candy look.
+                    vec3 deepBlue = vec3(0.006, 0.105, 0.205);
+                    vec3 oceanTeal = vec3(0.012, 0.36, 0.49);
+                    vec3 sunlitAqua = vec3(0.075, 0.66, 0.70);
+                    vec3 body = mix(deepBlue, oceanTeal, smoothstep(0.04, 0.88, depth));
+                    body = mix(body, sunlitAqua, smoothstep(0.70, 1.0, depth) * 0.46);
+                    float caustics = causticPattern(hit);
+                    float softGlow = 0.5 + 0.5 * sin(hit.x * 5.5 + hit.z * 4.0 - uTime * 0.7);
+                    body += vec3(0.035, 0.20, 0.22) * caustics * (0.32 + 0.24 * softGlow);
+                    float spec = pow(max(dot(reflect(-lightDir,n),viewDir),0.0), 46.0);
+                    float sharpSpec = pow(max(dot(reflect(-lightDir,n),viewDir),0.0), 110.0);
+                    float surfaceFactor = smoothstep(0.66,0.95,n.y);
+                    vec3 surfaceColor = vec3(0.018,0.43,0.51) + vec3(0.12,0.35,0.34)*diffuse;
+                    float flowingRibbon = pow(max(0.0, sin(hit.x * 17.0 + hit.z * 8.0 - uTime * 1.35)), 13.0);
+                    surfaceColor += vec3(0.08,0.28,0.28) * flowingRibbon;
+                    surfaceColor += vec3(0.62,0.91,0.92) * (spec * 0.55 + sharpSpec * 0.85 + fresnel * 0.30);
                     color = mix(body, surfaceColor, surfaceFactor);
-                    color += vec3(0.35,0.76,0.78) * fresnel * 0.18;
+                    color += vec3(0.18,0.72,0.80) * fresnel * 0.22;
                 }
 
                 // Glass vessel: rounded silhouette, bright polished edges and front-face reflections.
