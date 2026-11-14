@@ -66,7 +66,12 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
     @Volatile private var gravityY = 1f
     @Volatile private var gravityZ = 0f
     @Volatile private var shake = 0f
-    @Volatile private var lastMagnitude = 1f
+    private var previousX = 0f
+    private var previousY = 1f
+    private var previousZ = 0f
+    private var filteredX = 0f
+    private var filteredY = 1f
+    private var filteredZ = 0f
     private var program = 0
     private var timeHandle = 0
     private var gravityHandle = 0
@@ -77,13 +82,21 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
     private lateinit var vertexBuffer: FloatBuffer
 
     fun setGravity(x: Float, y: Float, z: Float) {
-        gravityX = x
-        gravityY = y
-        gravityZ = z
-        val magnitude = kotlin.math.sqrt(x * x + y * y + z * z)
-        val delta = abs(magnitude - lastMagnitude)
-        if (delta > 0.30f) shake = min(1.6f, shake + delta * 1.5f)
-        lastMagnitude = magnitude
+        // Low-pass sensor noise while retaining quick movement for splash impulses.
+        val dx = x - previousX
+        val dy = y - previousY
+        val dz = z - previousZ
+        val motion = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
+        if (motion > 0.10f) shake = min(1.6f, shake + motion * 0.72f)
+        previousX = x
+        previousY = y
+        previousZ = z
+        filteredX += (x - filteredX) * 0.22f
+        filteredY += (y - filteredY) * 0.22f
+        filteredZ += (z - filteredZ) * 0.22f
+        gravityX = filteredX
+        gravityY = filteredY
+        gravityZ = filteredZ
     }
 
     override fun onSurfaceCreated(glUnused: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
@@ -127,7 +140,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
                 return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
             }
             vec3 surfaceNormal(vec3 p, vec3 g) {
-                vec3 n = normalize(vec3(-g.x, 1.0, -g.y));
+                vec3 n = normalize(vec3(-g.x, max(0.16, abs(g.y)), -g.z));
                 float w = 0.010 * sin(p.x * 13.0 + uTime * 1.7)
                         + 0.006 * sin(p.z * 19.0 - uTime * 1.25)
                         + uShake * 0.012 * sin(p.x * 23.0 + p.z * 17.0 - uTime * 7.0);
