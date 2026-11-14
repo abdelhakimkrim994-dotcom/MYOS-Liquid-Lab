@@ -267,7 +267,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     }
 
     override fun onSurfaceCreated(glUnused: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
-        GLES30.glClearColor(0.008f, 0.018f, 0.027f, 1f)
+        GLES30.glClearColor(1f, 1f, 1f, 1f)
         GLES30.glDisable(GLES30.GL_DEPTH_TEST)
         val vertex = """
             #version 300 es
@@ -382,7 +382,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                                            0.0,
                                            -0.11 * cos(p.z * 19.0 - uTime * 1.25)));
             }
-            float waterDistance(vec3 p, vec3 up) {
+            float freeSurfaceDistance(vec3 p, vec3 up, float surfaceOffset) {
                 vec3 n = normalize(up);
                 float energy = clamp(length(uFlow) * 0.018 + uShake * 0.008, 0.0, 0.032);
                 vec2 fluidUv = clamp(vec2(p.x / (2.0 * TANK.x) + 0.5,
@@ -391,9 +391,22 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 float wave = 0.0025 * sin(p.x * 11.0 + uTime * 1.1)
                            + 0.0018 * sin(p.z * 15.0 - uTime * 0.9)
                            + energy * sin(p.x * 10.0 + p.z * 7.0 - uTime * 3.6);
+                return dot(p, n) + surfaceOffset + wave - simulatedHeight;
+            }
+            float waterDistance(vec3 p, vec3 up) {
                 float container = sdRoundBox(p, TANK - vec3(0.018), 0.025);
-                float freeSurface = dot(p, n) + uSurfaceOffset + wave - simulatedHeight;
-                return max(container, freeSurface);
+                return max(container, freeSurfaceDistance(p, up, uSurfaceOffset));
+            }
+            vec3 displacedSurfaceNormal(vec3 p, vec3 up, float surfaceOffset) {
+                float e = 0.0025;
+                return normalize(vec3(
+                    freeSurfaceDistance(p + vec3(e,0,0), up, surfaceOffset) -
+                    freeSurfaceDistance(p - vec3(e,0,0), up, surfaceOffset),
+                    freeSurfaceDistance(p + vec3(0,e,0), up, surfaceOffset) -
+                    freeSurfaceDistance(p - vec3(0,e,0), up, surfaceOffset),
+                    freeSurfaceDistance(p + vec3(0,0,e), up, surfaceOffset) -
+                    freeSurfaceDistance(p - vec3(0,0,e), up, surfaceOffset)
+                ));
             }
             vec3 waterNormal(vec3 p, vec3 up) {
                 float e = 0.0025;
@@ -434,11 +447,39 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                             vec3 wb, out vec3 nOut, out float viaSurface) {
                 vec3 boxNormal;
                 float tBox = exitBox(p, r, wb, boxNormal);
-                float ds = dot(r, up);
-                float tSurface = ds > 0.0001
-                    ? max(-(dot(p, up) + surfaceOffset) / ds, 0.0) : 1e9;
+                float tSurface = 1e9;
+                vec3 surfaceNormalOut = normalize(up);
+
+                // Find the first inside-to-outside crossing of the same displaced
+                // free surface used by waterDistance(). The tank-wall path remains
+                // the existing analytic inner-box approximation.
+                float previousT = 0.0;
+                float previousF = freeSurfaceDistance(p, up, surfaceOffset);
+                if (previousF < 0.0 && tBox > 0.0 && tBox < 1e8) {
+                    for (int i = 1; i <= 16; i++) {
+                        float sampleT = tBox * (float(i) / 16.0);
+                        float sampleF = freeSurfaceDistance(p + r * sampleT, up, surfaceOffset);
+                        if (previousF < 0.0 && sampleF >= 0.0) {
+                            float lo = previousT;
+                            float hi = sampleT;
+                            for (int j = 0; j < 10; j++) {
+                                float mid = 0.5 * (lo + hi);
+                                float midF = freeSurfaceDistance(p + r * mid, up, surfaceOffset);
+                                if (midF < 0.0) lo = mid;
+                                else hi = mid;
+                            }
+                            tSurface = hi;
+                            surfaceNormalOut = displacedSurfaceNormal(
+                                p + r * tSurface, up, surfaceOffset);
+                            break;
+                        }
+                        previousT = sampleT;
+                        previousF = sampleF;
+                    }
+                }
+
                 if (tSurface < tBox) {
-                    nOut = normalize(up);
+                    nOut = surfaceNormalOut;
                     viaSurface = 1.0;
                     return tSurface;
                 }
@@ -450,14 +491,11 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 // Select the far plane in the ray's travel direction. This explicitly
                 // handles positive-Z rays instead of clamping them to the rear plane.
                 float planeZ = r.z < 0.0 ? -0.80 : 0.80;
-                if (abs(r.z) < 0.0001) return vec3(0.008, 0.022, 0.030);
+                if (abs(r.z) < 0.0001) return vec3(4.0);
                 float t = max((planeZ - p.z) / r.z, 0.0);
                 vec3 q = p + r * t;
-                float gx = abs(fract(q.x * 5.0) - 0.5);
-                float gy = abs(fract(q.y * 5.0) - 0.5);
-                float grid = 1.0 - smoothstep(0.04, 0.10, min(gx, gy));
-                return vec3(0.010, 0.031, 0.043) +
-                       vec3(0.012, 0.036, 0.043) * grid * 0.22;
+                // Featureless white studio backdrop for clean optical testing.
+                return vec3(4.0);
             }
             void main() {
                 vec2 uv = vUv;
@@ -470,7 +508,9 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 vec3 ro = vec3(eye, 3.35);
                 vec3 rd = normalize(vec3(win - eye, TANK.z - 3.35));
                 vec3 up = normalize(uUp);
-                vec3 background = vec3(0.009, 0.025, 0.038);
+                // Linear value above 1.0 compensates for the final filmic-style
+                // exponential mapping so the empty test space renders near pure white.
+                vec3 background = vec3(4.0);
                 float inRect = 1.0 - smoothstep(0.0, 0.012,
                     sdRoundRect(win, TANK.xy, 0.055));
                 // The backdrop is a real plane behind the tank. Guard both ray
@@ -480,12 +520,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 float backdropZ = rd.z < 0.0 ? -0.80 : 0.80;
                 float backdropT = (backdropZ - ro.z) / backdropDenom;
                 vec3 backdropPoint = ro + rd * max(backdropT, 0.0);
-                float gridFine = 1.0 - smoothstep(0.04, 0.10,
-                    min(abs(fract(backdropPoint.x * 5.0) - 0.5),
-                        abs(fract(backdropPoint.y * 5.0) - 0.5)));
-                vec3 backdropColor = vec3(0.010, 0.031, 0.043) +
-                    vec3(0.012, 0.036, 0.043) * gridFine * 0.22;
-                background = mix(background, backdropColor, inRect * 0.72);
+                // Keep the tank interior and exterior on the same white test field.
+                background = vec3(4.0);
                 // Keep the background uniform: the old radial halo looked like a
                 // persistent glowing blob trapped in the center of the water.
 
@@ -515,16 +551,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                                + 0.5 * smoothstep(0.55, 0.60, diff);
                     body *= 0.76 + 0.30 * band;
 
-                    // Tri-planar projection prevents streaks on vertical tank faces.
-                    float caustics = triCaustics(hit, n);
-                    vec3 seaGlass = vec3(0.30, 0.77, 0.68);
-                    vec3 warmSandLight = vec3(0.72, 0.78, 0.57);
-                    body += mix(seaGlass, warmSandLight, 0.16) *
-                            caustics * 0.27 * (1.0 - below * 0.58);
-
-                    float bubbleMask = bubbles(hit.xy, uTime);
-                    body += vec3(0.68, 0.91, 0.88) * bubbleMask *
-                            0.42 * smoothstep(0.30, 0.80, n.z);
+                    // Bubble sprites and animated caustic-line overlays are disabled
+                    // for clean material and refraction testing.
 
                     float rimLight = pow(1.0 - max(dot(n, viewDir), 0.0), 2.5);
                     body += vec3(0.20, 0.58, 0.68) * rimLight * 0.20;
@@ -547,8 +575,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                     if (dot(rayInside, rayInside) > 0.000001) {
                         vec3 wb = TANK - vec3(0.018);
                         vec3 insidePoint = hit + rayInside * 0.004;
-                        bool insideStart = sdRoundBox(insidePoint, wb, 0.0) < -0.0005 &&
-                                           dot(insidePoint, up) + uSurfaceOffset < 0.0;
+                        // Use the exact same rounded, wave-displaced water volume as the ray marcher.
+                        bool insideStart = waterDistance(insidePoint, up) < -0.0005;
                         if (insideStart) {
                             float totalWaterLength = 0.0;
                             vec3 exitPoint = insidePoint;
@@ -577,8 +605,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                                 if (bounce == 1) break;
                                 rayInside = reflect(rayInside, exitNormal);
                                 insidePoint = exitPoint - exitNormal * 0.004 + rayInside * 0.002;
-                                insideStart = sdRoundBox(insidePoint, wb, 0.0) < -0.0005 &&
-                                              dot(insidePoint, up) + uSurfaceOffset < 0.0;
+                                // Revalidate the reflected ray against the same displaced water volume.
+                                insideStart = waterDistance(insidePoint, up) < -0.0005;
                                 if (!insideStart) break;
                             }
 
@@ -587,10 +615,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                             if (escaped) {
                                 vec3 farGlass = sampleBackdrop(exitPoint + rayOutside * 0.003,
                                                                 normalize(rayOutside));
-                                float causticLight = triCaustics(exitPoint, exitNormal);
-                                float bubbleLight = bubbles(exitPoint.xy, uTime * 0.72);
-                                farGlass += vec3(0.10, 0.39, 0.39) * causticLight * 0.55;
-                                farGlass += vec3(0.48, 0.82, 0.78) * bubbleLight * 0.28;
+                                // No procedural caustic or bubble overlays in this test mode.
                                 vec3 inScatter = vec3(0.018, 0.105, 0.115) *
                                                  (1.0 - transmittance);
                                 vec3 transmitted = farGlass * transmittance + inScatter;
@@ -619,7 +644,9 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 }
 
                 float perspectiveEdges = boxEdges(ro, rd);
-                color += vec3(0.20, 0.49, 0.57) * perspectiveEdges * 0.48;
+                // Subtle neutral edge contrast keeps the clear glass vessel readable
+                // against the white studio field without a colored neon outline.
+                color += vec3(0.42, 0.48, 0.50) * perspectiveEdges * 0.20;
 
                 // Front glass is evaluated on its actual plane, not a constant
                 // ray-distance slice (which curved the tank during parallax).
@@ -628,18 +655,17 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 float shell = abs(sdRoundRect(pNear.xy, TANK.xy, 0.055));
                 float edge = (1.0 - smoothstep(0.002, 0.013, shell)) * inRect;
                 float rim = (1.0 - smoothstep(0.018, 0.045, shell)) * inRect;
-                color += vec3(0.27,0.64,0.72) * edge * 0.72;
-                color += vec3(0.10,0.27,0.32) * rim * 0.20;
+                color += vec3(0.78,0.86,0.88) * edge * 0.62;
+                color += vec3(0.42,0.50,0.53) * rim * 0.12;
                 float leftStrip = exp(-pow((pNear.x + 0.365)*45.0,2.0)) *
                                   smoothstep(-0.82,0.72,pNear.y) * inRect;
                 float rightStrip = exp(-pow((pNear.x - 0.37)*54.0,2.0)) *
                                    smoothstep(-0.78,0.78,pNear.y) * inRect;
-                color += vec3(0.42,0.72,0.78) * (leftStrip*0.24 + rightStrip*0.12);
+                color += vec3(0.92,0.97,0.98) * (leftStrip*0.30 + rightStrip*0.16);
                 float topGlare = exp(-pow((pNear.y - 0.85)*38.0,2.0)) *
                                  smoothstep(-0.34,0.34,pNear.x) * inRect;
-                color += vec3(0.52,0.78,0.82) * topGlare * 0.25;
-                float vignette = 1.0 - smoothstep(0.25, 1.05, length(screen*vec2(0.85,0.72)));
-                color *= 0.72 + 0.28*vignette;
+                color += vec3(1.0,1.0,1.0) * topGlare * 0.30;
+                // No global vignette: the white test field must remain uniformly white.
                 // Gentle exponential tone mapping keeps highlights bright without clipping.
                 color = 1.0 - exp(-max(color, vec3(0.0)) * 1.35);
                 fragColor = vec4(color,1.0);
