@@ -547,8 +547,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                     if (dot(rayInside, rayInside) > 0.000001) {
                         vec3 wb = TANK - vec3(0.018);
                         vec3 insidePoint = hit + rayInside * 0.004;
-                        bool insideStart = sdRoundBox(insidePoint, wb, 0.0) < -0.0005 &&
-                                           dot(insidePoint, up) + uSurfaceOffset < 0.0;
+                        // Use the exact same rounded, wave-displaced water volume as the ray marcher.
+                        bool insideStart = waterDistance(insidePoint, up) < -0.0005;
                         if (insideStart) {
                             float totalWaterLength = 0.0;
                             vec3 exitPoint = insidePoint;
@@ -577,8 +577,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                                 if (bounce == 1) break;
                                 rayInside = reflect(rayInside, exitNormal);
                                 insidePoint = exitPoint - exitNormal * 0.004 + rayInside * 0.002;
-                                insideStart = sdRoundBox(insidePoint, wb, 0.0) < -0.0005 &&
-                                              dot(insidePoint, up) + uSurfaceOffset < 0.0;
+                                // Revalidate the reflected ray against the same displaced water volume.
+                                insideStart = waterDistance(insidePoint, up) < -0.0005;
                                 if (!insideStart) break;
                             }
 
