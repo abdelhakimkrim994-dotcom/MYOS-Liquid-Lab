@@ -7,17 +7,17 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Small, deterministic shallow-water surface solver.
+ * Stable, volume-preserving shallow-water surface solver.
  *
- * This is deliberately separate from rendering: it evolves surface height and
- * horizontal velocity on a modest grid, then exposes the height field as a
- * texture for the renderer. It is a mobile-friendly first physics layer, not
- * a full 3D Navier-Stokes/MPM solver.
+ * The solver runs at a fixed 1/120 s step with a small cross-shaped
+ * height blur and zero-mean correction. It is a 2D surface approximation,
+ * not a full 3D fluid solver.
  */
 internal class FluidSurfaceSimulation(private val size: Int = 40) {
     private val count = size * size
     private val height = FloatArray(count)
     private val nextHeight = FloatArray(count)
+    private val smoothHeight = FloatArray(count)
     private val velocityX = FloatArray(count)
     private val velocityZ = FloatArray(count)
     private val nextVelocityX = FloatArray(count)
@@ -28,7 +28,9 @@ internal class FluidSurfaceSimulation(private val size: Int = 40) {
     private val spacing = 2f / (size - 1)
     private val waterDepth = 0.30f
     private val gravity = 1.35f
-    private val damping = 1.15f
+    private val damping = 2.4f
+    private val fixedStep = 1f / 120f
+    private var accumulator = 0f
     private var impulseX = 0f
     private var impulseZ = 0f
 
@@ -38,29 +40,34 @@ internal class FluidSurfaceSimulation(private val size: Int = 40) {
         impulseZ = (impulseZ + z).coerceIn(-3.5f, 3.5f)
     }
 
+    @Synchronized
     fun step(deltaSeconds: Float) {
-        val dt = deltaSeconds.coerceIn(0f, 1f / 30f)
-        if (dt <= 0f) return
-
-        val ix: Float
-        val iz: Float
-        synchronized(this) {
-            ix = impulseX
-            iz = impulseZ
-            impulseX = 0f
-            impulseZ = 0f
+        accumulator = min(accumulator + deltaSeconds.coerceIn(0f, 0.04f), fixedStep * 4f)
+        var steps = 0
+        while (accumulator >= fixedStep && steps < 4) {
+            simulate(fixedStep)
+            accumulator -= fixedStep
+            steps++
         }
+    }
 
-        // Apply phone-motion impulses as momentum, strongest in the interior.
+    private fun simulate(dt: Float) {
+        val ix = impulseX
+        val iz = impulseZ
+        impulseX = 0f
+        impulseZ = 0f
+
+        // Inject momentum smoothly in the interior rather than exciting boundary cells.
         if (ix != 0f || iz != 0f) {
             for (z in 1 until size - 1) {
                 for (x in 1 until size - 1) {
                     val nx = (x - (size - 1) * 0.5f) / (size * 0.5f)
                     val nz = (z - (size - 1) * 0.5f) / (size * 0.5f)
-                    val centerWeight = 0.72f + 0.28f * (1f - min(1f, nx * nx + nz * nz))
+                    val r2 = nx * nx + nz * nz
+                    val weight = 0.35f + 0.65f * (1f - min(1f, r2))
                     val i = z * size + x
-                    velocityX[i] += ix * centerWeight
-                    velocityZ[i] += iz * centerWeight
+                    velocityX[i] += ix * weight
+                    velocityZ[i] += iz * weight
                 }
             }
         }
@@ -69,7 +76,7 @@ internal class FluidSurfaceSimulation(private val size: Int = 40) {
         val invDx2 = 1f / (spacing * spacing)
         val dampingFactor = max(0f, 1f - damping * dt)
 
-        // Shallow-water continuity and momentum equations, with solid side walls.
+        // Semi-discrete shallow-water continuity and momentum equations.
         for (z in 1 until size - 1) {
             for (x in 1 until size - 1) {
                 val i = z * size + x
@@ -80,22 +87,21 @@ internal class FluidSurfaceSimulation(private val size: Int = 40) {
 
                 val divergence =
                     (velocityX[right] - velocityX[left] + velocityZ[up] - velocityZ[down]) * invTwoDx
-                nextHeight[i] = (height[i] - waterDepth * divergence * dt).coerceIn(-0.11f, 0.11f)
+                nextHeight[i] = height[i] - waterDepth * divergence * dt
 
                 val gradientX = (height[right] - height[left]) * invTwoDx
                 val gradientZ = (height[up] - height[down]) * invTwoDx
                 val laplacian = (height[left] + height[right] + height[down] + height[up] - 4f * height[i]) * invDx2
 
-                // Pressure-gradient response, mild viscosity and momentum damping.
                 nextVelocityX[i] = (velocityX[i] - gravity * gradientX * dt) * dampingFactor
                 nextVelocityZ[i] = (velocityZ[i] - gravity * gradientZ * dt) * dampingFactor
-                // A small curvature term suppresses grid noise without erasing wave motion.
-                nextVelocityX[i] += 0.0008f * laplacian * dt
-                nextVelocityZ[i] += 0.0008f * laplacian * dt
+                // Mild viscosity damps grid-scale noise without injecting height.
+                nextVelocityX[i] += 0.00035f * laplacian * dt
+                nextVelocityZ[i] += 0.00035f * laplacian * dt
             }
         }
 
-        // Reflecting walls: no fluid crosses the vessel boundary.
+        // No-through-flow boundaries with zero-normal-gradient height.
         for (x in 0 until size) {
             val top = (size - 1) * size + x
             val bottom = x
@@ -120,6 +126,36 @@ internal class FluidSurfaceSimulation(private val size: Int = 40) {
         System.arraycopy(nextHeight, 0, height, 0, count)
         System.arraycopy(nextVelocityX, 0, velocityX, 0, count)
         System.arraycopy(nextVelocityZ, 0, velocityZ, 0, count)
+
+        // Three-tap-style cross blur: center plus its four immediate neighbors.
+        for (z in 1 until size - 1) {
+            for (x in 1 until size - 1) {
+                val i = z * size + x
+                smoothHeight[i] = 0.50f * height[i] +
+                    0.125f * (height[i - 1] + height[i + 1] + height[i - size] + height[i + size])
+            }
+        }
+        for (x in 0 until size) {
+            smoothHeight[x] = smoothHeight[x + size]
+            smoothHeight[(size - 1) * size + x] = smoothHeight[(size - 2) * size + x]
+        }
+        for (z in 0 until size) {
+            smoothHeight[z * size] = smoothHeight[z * size + 1]
+            smoothHeight[z * size + size - 1] = smoothHeight[z * size + size - 2]
+        }
+        System.arraycopy(smoothHeight, 0, height, 0, count)
+
+        // Preserve the mean surface height (and therefore the represented water volume).
+        var sum = 0f
+        for (value in height) sum += value
+        val mean = sum / count
+        for (i in height.indices) height[i] = (height[i] - mean).coerceIn(-0.045f, 0.045f)
+
+        // Remove the tiny residual mean introduced by the safety limiter.
+        sum = 0f
+        for (value in height) sum += value
+        val correction = sum / count
+        for (i in height.indices) height[i] -= correction
     }
 
     @Synchronized
