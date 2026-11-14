@@ -10,6 +10,10 @@ import android.opengl.GLES30
 import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.view.View
+import android.widget.FrameLayout
+import android.widget.TextView
+import android.graphics.Color
+import android.view.Gravity
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -22,20 +26,38 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var renderer: LiquidRenderer
     private lateinit var sensors: SensorManager
     private var accelerometer: Sensor? = null
+    private lateinit var diagnostics: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
         sensors = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        renderer = LiquidRenderer()
+        diagnostics = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 10f
+            setPadding(10, 7, 10, 7)
+            setBackgroundColor(0x99000000.toInt())
+            text = "Starting diagnostics…"
+        }
+        renderer = LiquidRenderer { line ->
+            diagnostics.post { diagnostics.text = line }
+        }
         gl = GLSurfaceView(this).apply {
             setEGLContextClientVersion(3)
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
             preserveEGLContextOnPause = true
         }
-        setContentView(gl)
+        val root = FrameLayout(this)
+        root.addView(gl, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+        ))
+        root.addView(diagnostics, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.START
+        ))
+        setContentView(root)
     }
 
     override fun onResume() {
@@ -61,7 +83,7 @@ class MainActivity : Activity(), SensorEventListener {
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 }
 
-private class LiquidRenderer : GLSurfaceView.Renderer {
+private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSurfaceView.Renderer {
     @Volatile private var gravityX = 0f
     @Volatile private var gravityY = 1f
     @Volatile private var gravityZ = 0f
@@ -87,6 +109,9 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
     private var shakeHandle = 0
     private var surfaceOffsetHandle = 0
     private val volumeSolver = SurfaceVolumeSolver()
+    private var lastGoodSurfaceOffset = 0f
+    private var frameCounter = 0L
+    private var lastDiagnosticsNanos = 0L
     private var startNanos = 0L
     private var lastNanos = 0L
     private lateinit var vertexBuffer: FloatBuffer
@@ -279,7 +304,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
 
     override fun onDrawFrame(glUnused: javax.microedition.khronos.opengles.GL10?) {
         val now = System.nanoTime()
-        val dt = ((now - lastNanos) / 1_000_000_000f).coerceIn(0f, 0.04f)
+        val dt = ((now - lastNanos) / 1_000_000_000f).coerceIn(0f, 0.033f)
         lastNanos = now
         shake = max(0f, shake - dt * 1.25f)
         val targetX = (gravityX * 0.82f).coerceIn(-1.15f, 1.15f)
@@ -298,8 +323,11 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         val surfaceNormalX = -fluidX
         val surfaceNormalY = max(0.16f, abs(gravityY))
         val surfaceNormalZ = -fluidZ
-        val surfaceOffset = volumeSolver.offsetForHalfFill(surfaceNormalX, surfaceNormalY, surfaceNormalZ)
-        GLES30.glUniform1f(surfaceOffsetHandle, surfaceOffset)
+        val rawSurfaceOffset = volumeSolver.offsetForHalfFill(surfaceNormalX, surfaceNormalY, surfaceNormalZ)
+        if (rawSurfaceOffset.isFinite()) {
+            lastGoodSurfaceOffset = rawSurfaceOffset.coerceIn(-1.5f, 1.5f)
+        }
+        GLES30.glUniform1f(surfaceOffsetHandle, lastGoodSurfaceOffset)
         GLES30.glUniform2f(flowHandle, fluidVelocityX, fluidVelocityZ)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, fluidHeightTexture)
@@ -317,6 +345,16 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         GLES30.glVertexAttribPointer(0, 2, GLES30.GL_FLOAT, false, 0, vertexBuffer)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
         GLES30.glDisableVertexAttribArray(0)
+
+        frameCounter++
+        if (now - lastDiagnosticsNanos >= 250_000_000L) {
+            lastDiagnosticsNanos = now
+            onDiagnostics(
+                "frames: $frameCounter   gravity: %.2f, %.2f, %.2f   offset: %.4f".format(
+                    gravityX, gravityY, gravityZ, lastGoodSurfaceOffset
+                )
+            )
+        }
     }
 
     private fun linkProgram(vertexSource: String, fragmentSource: String): Int {
