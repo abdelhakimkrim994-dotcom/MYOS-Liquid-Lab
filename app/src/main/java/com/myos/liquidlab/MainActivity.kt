@@ -444,19 +444,19 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                         float waterLength = max(exitT - enterT, 0.0);
                         vec3 viewDir = -rd;
 
-                        // The far boundary is either the free surface or a tank wall.
-                        // Wall detail remains visible through wavelength-dependent
-                        // absorption instead of being covered by an opaque water color.
-                        vec3 transmittedBackground = background;
-                        if (!exitsAtSurface) {
-                            float backCaustics = triCaustics(exitPoint, exitNormal);
-                            float backBubbles = bubbles(exitPoint.xy, uTime * 0.72);
-                            transmittedBackground = vec3(0.018, 0.052, 0.071);
-                            transmittedBackground += vec3(0.12, 0.42, 0.41) * backCaustics * 0.72;
-                            transmittedBackground += vec3(0.52, 0.86, 0.82) * backBubbles * 0.34;
-                            float backFacingLight = max(dot(exitNormal, normalize(vec3(-0.45, 0.78, 0.62))), 0.0);
-                            transmittedBackground *= 0.78 + 0.22 * backFacingLight;
-                        }
+                        // Continue through any air gap after the water boundary to the
+                        // far tank wall. This is essential when a side-view ray exits the
+                        // water at the free surface before reaching the opposite glass.
+                        vec3 farWallPoint = ro + rd * boxFar;
+                        vec3 farWallNormal = boxFarNormal;
+                        float backCaustics = triCaustics(farWallPoint, farWallNormal);
+                        float backBubbles = bubbles(farWallPoint.xy, uTime * 0.72);
+                        vec3 transmittedBackground = vec3(0.018, 0.052, 0.071);
+                        transmittedBackground += vec3(0.12, 0.42, 0.41) * backCaustics * 0.72;
+                        transmittedBackground += vec3(0.52, 0.86, 0.82) * backBubbles * 0.34;
+                        float backFacingLight = max(dot(farWallNormal,
+                            normalize(vec3(-0.45, 0.78, 0.62))), 0.0);
+                        transmittedBackground *= 0.78 + 0.22 * backFacingLight;
 
                         // Beer-Lambert attenuation: red is absorbed fastest, blue-green
                         // survives farther, while a small in-scattering term gives water body.
@@ -481,11 +481,9 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
 
                         // Soft light detail is projected onto whichever tank wall is
                         // visible through the water, independent of its orientation.
-                        if (!exitsAtSurface) {
-                            float causticGlow = triCaustics(exitPoint, exitNormal);
-                            color += vec3(0.035, 0.105, 0.095) * causticGlow *
-                                     transmittance * 0.55;
-                        }
+                        float causticGlow = triCaustics(farWallPoint, farWallNormal);
+                        color += vec3(0.035, 0.105, 0.095) * causticGlow *
+                                 transmittance * 0.55;
 
                         // A subtle surface ripple/meniscus cue appears when the ray
                         // enters or exits through the free surface, at any orientation.
