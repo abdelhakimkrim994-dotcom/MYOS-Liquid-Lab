@@ -357,6 +357,30 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 hit = vec3(0.0);
                 return false;
             }
+            // Robust slab intersection against the tank's inner bounds.
+            // Returns outward-facing normals for the near and far box faces.
+            bool rayBox(vec3 ro, vec3 rd, vec3 halfSize,
+                        out float tNear, out float tFar,
+                        out vec3 nearNormal, out vec3 farNormal) {
+                vec3 safeRd = sign(rd) * max(abs(rd), vec3(0.000001));
+                vec3 invRd = 1.0 / safeRd;
+                vec3 a = (-halfSize - ro) * invRd;
+                vec3 b = ( halfSize - ro) * invRd;
+                vec3 lo = min(a, b);
+                vec3 hi = max(a, b);
+                tNear = max(lo.x, max(lo.y, lo.z));
+                tFar = min(hi.x, min(hi.y, hi.z));
+                if (tFar < max(tNear, 0.0)) return false;
+
+                if (lo.x >= lo.y && lo.x >= lo.z) nearNormal = vec3(-sign(rd.x), 0.0, 0.0);
+                else if (lo.y >= lo.z) nearNormal = vec3(0.0, -sign(rd.y), 0.0);
+                else nearNormal = vec3(0.0, 0.0, -sign(rd.z));
+
+                if (hi.x <= hi.y && hi.x <= hi.z) farNormal = vec3(sign(rd.x), 0.0, 0.0);
+                else if (hi.y <= hi.z) farNormal = vec3(0.0, sign(rd.y), 0.0);
+                else farNormal = vec3(0.0, 0.0, sign(rd.z));
+                return true;
+            }
             void main() {
                 vec2 uv = vUv;
                 float aspect = uResolution.x / uResolution.y;
@@ -368,95 +392,108 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 // Keep the background uniform: the old radial halo looked like a
                 // persistent glowing blob trapped in the center of the water.
 
-                // Ray-marched intersection of a real 3D liquid volume with its container.
-                vec3 hit;
-                float travel;
+                // Universal water-volume intersection.
+                // Clip the camera ray to both the tank box and the gravity-aligned
+                // half-space below the free surface. This works at every phone angle.
                 vec3 color = background;
-                if (traceWater(ro, rd, up, hit, travel)) {
-                    vec3 n = waterNormal(hit, up);
-                    vec3 viewDir = normalize(ro - hit);
-                    vec3 lightDir = normalize(vec3(-0.45, 0.78, 0.62));
+                vec3 innerHalf = TANK - vec3(0.018);
+                float boxNear;
+                float boxFar;
+                vec3 boxNearNormal;
+                vec3 boxFarNormal;
+                bool hasBox = rayBox(ro, rd, innerHalf, boxNear, boxFar,
+                                     boxNearNormal, boxFarNormal);
+                if (hasBox) {
+                    float enterT = max(boxNear, 0.0);
+                    float exitT = boxFar;
+                    vec3 enterNormal = boxNearNormal;
+                    vec3 exitNormal = boxFarNormal;
+                    bool entersAtSurface = false;
+                    bool exitsAtSurface = false;
 
-                    // Signed distance from the gravity-aligned free surface.
-                    // Negative values are below the surface and remain correct while tilted.
-                    float s = dot(hit, up) + uSurfaceOffset;
-                    float below = clamp(-s * 1.15, 0.0, 1.0);
-
-                    // Ocean turquoise -> clear aqua -> deep indigo, with depth tied to the plane.
-                    vec3 shallow = vec3(0.19, 0.78, 0.69);
-                    vec3 tropical = vec3(0.035, 0.43, 0.57);
-                    vec3 deep = vec3(0.055, 0.16, 0.39);
-                    vec3 body = mix(shallow, tropical, smoothstep(0.0, 0.38, below));
-                    body = mix(body, deep, smoothstep(0.32, 1.0, below));
-
-                    float diff = max(dot(n, lightDir), 0.0);
-                    float band = 0.5 * smoothstep(0.15, 0.20, diff)
-                               + 0.5 * smoothstep(0.55, 0.60, diff);
-                    body *= 0.76 + 0.30 * band;
-
-                    // Tri-planar projection prevents streaks on vertical tank faces.
-                    float caustics = triCaustics(hit, n);
-                    vec3 seaGlass = vec3(0.30, 0.77, 0.68);
-                    vec3 warmSandLight = vec3(0.72, 0.78, 0.57);
-                    body += mix(seaGlass, warmSandLight, 0.16) *
-                            caustics * 0.27 * (1.0 - below * 0.58);
-
-                    float bubbleMask = bubbles(hit.xy, uTime);
-                    body += vec3(0.68, 0.91, 0.88) * bubbleMask *
-                            0.42 * smoothstep(0.30, 0.80, n.z);
-
-                    float rimLight = pow(1.0 - max(dot(n, viewDir), 0.0), 2.5);
-                    body += vec3(0.20, 0.58, 0.68) * rimLight * 0.20;
-
-                    float surfaceFactor = smoothstep(0.66, 0.95, dot(n, up));
-                    vec3 top = mix(vec3(0.25, 0.78, 0.72),
-                                   vec3(0.68, 0.91, 0.83), diff * 0.58);
-                    float reflected = max(dot(reflect(-lightDir, n), viewDir), 0.0);
-                    float glint = step(0.965, reflected);
-                    top += vec3(0.72, 0.88, 0.76) * glint * 0.34;
-
-                    color = mix(body, top, surfaceFactor);
-
-                    // When the camera looks almost along the surface normal (phone
-                    // face-up), the visible hit is the water/air interface. Shade the
-                    // liquid as a transparent volume so the far glass remains visible.
-                    // The ordinary side-on path below remains unchanged for upright use.
-                    float viewAlignment = dot(up, viewDir);
-                    if (viewAlignment > 0.82) {
-                        vec3 innerHalf = TANK - vec3(0.018);
-                        float tx = abs(rd.x) < 0.0001 ? 1e4 :
-                            (rd.x > 0.0 ? (innerHalf.x - hit.x) / rd.x : (-innerHalf.x - hit.x) / rd.x);
-                        float ty = abs(rd.y) < 0.0001 ? 1e4 :
-                            (rd.y > 0.0 ? (innerHalf.y - hit.y) / rd.y : (-innerHalf.y - hit.y) / rd.y);
-                        float tz = abs(rd.z) < 0.0001 ? 1e4 :
-                            (rd.z > 0.0 ? (innerHalf.z - hit.z) / rd.z : (-innerHalf.z - hit.z) / rd.z);
-                        float exitT = min(tx, min(ty, tz));
-                        if (exitT > 0.0 && exitT < 2.0) {
-                            vec3 backPoint = hit + rd * exitT;
-                            vec3 backNormal = tx <= ty && tx <= tz ? vec3(sign(rd.x),0.0,0.0)
-                                              : (ty <= tz ? vec3(0.0,sign(rd.y),0.0)
-                                                          : vec3(0.0,0.0,sign(rd.z)));
-                            float backCaustics = triCaustics(backPoint, backNormal);
-                            float backBubbles = bubbles(backPoint.xy, uTime * 0.72);
-                            vec3 backGlass = vec3(0.025, 0.105, 0.16);
-                            backGlass += vec3(0.10, 0.39, 0.39) * backCaustics * 0.72;
-                            backGlass += vec3(0.48, 0.82, 0.78) * backBubbles * 0.34;
-
-                            // Wavelength-dependent absorption gives the shallow layer
-                            // turquoise color while retaining detail on the far glass.
-                            vec3 transmittance = exp(-vec3(1.10, 0.48, 0.30) * exitT);
-                            vec3 transmitted = backGlass * transmittance
-                                             + vec3(0.035, 0.22, 0.23) * (1.0 - transmittance);
-                            float fresnel = 0.02 + 0.12 * pow(1.0 - clamp(dot(n, viewDir), 0.0, 1.0), 5.0);
-                            color = mix(transmitted, top, fresnel);
+                    // Water occupies dot(position, up) + offset <= 0.
+                    float planeOrigin = dot(ro, up) + uSurfaceOffset;
+                    float planeDirection = dot(rd, up);
+                    bool validWaterInterval = true;
+                    if (abs(planeDirection) < 0.00001) {
+                        validWaterInterval = planeOrigin <= 0.0;
+                    } else {
+                        float surfaceT = -planeOrigin / planeDirection;
+                        if (planeDirection > 0.0) {
+                            if (surfaceT < exitT) {
+                                exitT = surfaceT;
+                                exitNormal = up;
+                                exitsAtSurface = true;
+                            }
+                        } else {
+                            if (surfaceT > enterT) {
+                                enterT = surfaceT;
+                                enterNormal = up;
+                                entersAtSurface = true;
+                            }
                         }
                     }
 
-                    // Thin warm-ivory meniscus where the water meets the glass.
-                    float foam = 1.0 - smoothstep(0.006, 0.026, abs(s));
-                    float sideFace = 1.0 - surfaceFactor;
-                    color = mix(color, vec3(0.83, 0.91, 0.78),
-                                foam * 0.62 * sideFace);
+                    if (validWaterInterval && exitT > enterT + 0.001) {
+                        vec3 entryPoint = ro + rd * enterT;
+                        vec3 exitPoint = ro + rd * exitT;
+                        float waterLength = max(exitT - enterT, 0.0);
+                        vec3 viewDir = -rd;
+
+                        // The far boundary is either the free surface or a tank wall.
+                        // Wall detail remains visible through wavelength-dependent
+                        // absorption instead of being covered by an opaque water color.
+                        vec3 transmittedBackground = background;
+                        if (!exitsAtSurface) {
+                            float backCaustics = triCaustics(exitPoint, exitNormal);
+                            float backBubbles = bubbles(exitPoint.xy, uTime * 0.72);
+                            transmittedBackground = vec3(0.018, 0.052, 0.071);
+                            transmittedBackground += vec3(0.12, 0.42, 0.41) * backCaustics * 0.72;
+                            transmittedBackground += vec3(0.52, 0.86, 0.82) * backBubbles * 0.34;
+                            float backFacingLight = max(dot(exitNormal, normalize(vec3(-0.45, 0.78, 0.62))), 0.0);
+                            transmittedBackground *= 0.78 + 0.22 * backFacingLight;
+                        }
+
+                        // Beer-Lambert attenuation: red is absorbed fastest, blue-green
+                        // survives farther, while a small in-scattering term gives water body.
+                        vec3 absorption = vec3(1.10, 0.48, 0.30);
+                        vec3 transmittance = exp(-absorption * waterLength);
+                        vec3 inScattering = vec3(0.018, 0.105, 0.115) *
+                                            (1.0 - transmittance);
+                        vec3 transmitted = transmittedBackground * transmittance + inScattering;
+
+                        // Fresnel is evaluated at whichever boundary the ray enters.
+                        // This keeps a restrained reflective sheen without hiding the tank.
+                        float facing = clamp(abs(dot(enterNormal, viewDir)), 0.0, 1.0);
+                        float fresnel = 0.02 + 0.10 * pow(1.0 - facing, 5.0);
+                        vec3 lightDir = normalize(vec3(-0.45, 0.78, 0.62));
+                        float surfaceWave = 0.5 + 0.5 * sin(entryPoint.x * 13.0 +
+                                                           entryPoint.z * 17.0 - uTime * 1.4);
+                        vec3 reflectedTint = vec3(0.12, 0.36, 0.38) +
+                                             vec3(0.16, 0.22, 0.18) * surfaceWave;
+                        reflectedTint += vec3(0.38, 0.54, 0.48) *
+                                         pow(max(dot(reflect(rd, enterNormal), lightDir), 0.0), 24.0) * 0.35;
+                        color = mix(transmitted, reflectedTint, fresnel);
+
+                        // Soft light detail is projected onto whichever tank wall is
+                        // visible through the water, independent of its orientation.
+                        if (!exitsAtSurface) {
+                            float causticGlow = triCaustics(exitPoint, exitNormal);
+                            color += vec3(0.035, 0.105, 0.095) * causticGlow *
+                                     transmittance * 0.55;
+                        }
+
+                        // A subtle surface ripple/meniscus cue appears when the ray
+                        // enters or exits through the free surface, at any orientation.
+                        if (entersAtSurface || exitsAtSurface) {
+                            vec3 surfacePoint = entersAtSurface ? entryPoint : exitPoint;
+                            float ripple = 0.5 + 0.5 * sin(surfacePoint.x * 24.0 +
+                                                          surfacePoint.z * 19.0 - uTime * 2.2);
+                            float glint = pow(max(dot(reflect(rd, up), lightDir), 0.0), 28.0);
+                            color += vec3(0.055, 0.13, 0.12) * ripple * 0.10;
+                            color += vec3(0.30, 0.48, 0.39) * glint * 0.18;
+                        }
+                    }
                 }
 
                 // Glass vessel: rounded silhouette, bright polished edges and front-face reflections.
