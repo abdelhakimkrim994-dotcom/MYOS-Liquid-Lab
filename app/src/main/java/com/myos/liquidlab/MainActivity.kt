@@ -637,10 +637,11 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     }
 
     private fun computeUp(gx: Float, gy: Float, gz: Float): FloatArray {
-        // Stage 0 device test confirmed the face-up Z direction is inverted with -1.
-        // Keep X unchanged; flip only Z so the solver and shader share the corrected up vector.
+        // Preserve the signed Y component. Using abs(gy) pins gravity to +Y and
+        // prevents the liquid from settling toward the opposite end when inverted.
+        // X/Z retain the device-tested Stage 0 sign calibration.
         val x = upSignX * gx
-        val y = max(0.16f, abs(gy))
+        val y = gy
         val z = upSignZ * gz
         val length = kotlin.math.sqrt(x * x + y * y + z * z).coerceAtLeast(0.0001f)
         computedUp[0] = x / length
