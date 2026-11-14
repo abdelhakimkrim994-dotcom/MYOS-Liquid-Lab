@@ -26,6 +26,7 @@ class MainActivity : Activity(), SensorEventListener {
     private lateinit var renderer: LiquidRenderer
     private lateinit var sensors: SensorManager
     private var accelerometer: Sensor? = null
+    private var linearAccelerometer: Sensor? = null
     private lateinit var diagnostics: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -33,6 +34,7 @@ class MainActivity : Activity(), SensorEventListener {
         window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY)
         sensors = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        linearAccelerometer = sensors.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
         diagnostics = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 10f
@@ -64,6 +66,7 @@ class MainActivity : Activity(), SensorEventListener {
         super.onResume()
         gl.onResume()
         accelerometer?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+        linearAccelerometer?.let { sensors.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
     }
 
     override fun onPause() {
@@ -73,31 +76,52 @@ class MainActivity : Activity(), SensorEventListener {
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
-        val ax = event.values[0] / SensorManager.GRAVITY_EARTH
-        val ay = event.values[1] / SensorManager.GRAVITY_EARTH
-        val az = event.values[2] / SensorManager.GRAVITY_EARTH
-        renderer.setGravity((-ax).coerceIn(-1.35f, 1.35f), ay.coerceIn(-1.35f, 1.35f), az.coerceIn(-1.35f, 1.35f))
+        when (event.sensor.type) {
+            Sensor.TYPE_ACCELEROMETER -> {
+                val ax = event.values[0] / SensorManager.GRAVITY_EARTH
+                val ay = event.values[1] / SensorManager.GRAVITY_EARTH
+                val az = event.values[2] / SensorManager.GRAVITY_EARTH
+                renderer.setGravity(-ax, ay, az, event.timestamp)
+            }
+            Sensor.TYPE_LINEAR_ACCELERATION -> {
+                renderer.setShakeAcceleration(
+                    event.values[0], event.values[1], event.values[2], event.timestamp
+                )
+            }
+        }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 }
 
 private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSurfaceView.Renderer {
-    @Volatile private var gravityX = 0f
-    @Volatile private var gravityY = 1f
-    @Volatile private var gravityZ = 0f
+    @Volatile private var targetGravityX = 0f
+    @Volatile private var targetGravityY = 1f
+    @Volatile private var targetGravityZ = 0f
+    @Volatile private var gravityJitterG = 0f
     @Volatile private var shake = 0f
-    private var previousX = 0f
-    private var previousY = 1f
-    private var previousZ = 0f
-    private var filteredX = 0f
-    private var filteredY = 1f
-    private var filteredZ = 0f
-    private var fluidX = 0f
-    private var fluidZ = 0f
-    private var fluidVelocityX = 0f
-    private var fluidVelocityZ = 0f
+    @Volatile private var pendingShakeX = 0f
+    @Volatile private var pendingShakeZ = 0f
+    private var filteredGravityX = 0f
+    private var filteredGravityY = 1f
+    private var filteredGravityZ = 0f
+    private var acceptedGravityX = 0f
+    private var acceptedGravityY = 1f
+    private var acceptedGravityZ = 0f
+    private var gravityFilterInitialized = false
+    private var lastSensorTimestamp = 0L
+    private val jitterTimes = LongArray(128)
+    private val jitterX = FloatArray(128)
+    private val jitterY = FloatArray(128)
+    private val jitterZ = FloatArray(128)
+    private var jitterIndex = 0
+    private var jitterCount = 0
+    private var springGravityX = 0f
+    private var springGravityY = 1f
+    private var springGravityZ = 0f
+    private var springVelocityX = 0f
+    private var springVelocityY = 0f
+    private var springVelocityZ = 0f
     private val fluidSimulation = FluidSurfaceSimulation()
     private var fluidHeightTexture = 0
     private var fluidHeightHandle = 0
@@ -116,25 +140,88 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     private var lastNanos = 0L
     private lateinit var vertexBuffer: FloatBuffer
 
-    fun setGravity(x: Float, y: Float, z: Float) {
-        // Low-pass sensor noise while retaining quick movement for splash impulses.
-        val dx = x - previousX
-        val dy = y - previousY
-        val dz = z - previousZ
-        val motion = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
-        if (motion > 0.035f) {
-            shake = min(1.6f, shake + motion * 0.92f)
-            fluidSimulation.addImpulse((x - previousX) * 0.82f, (z - previousZ) * 0.82f)
+    @Synchronized
+    fun setGravity(x: Float, y: Float, z: Float, timestampNanos: Long) {
+        val magnitude = kotlin.math.sqrt(x * x + y * y + z * z)
+        if (!magnitude.isFinite() || magnitude < 0.35f) return
+        val rx = x / magnitude
+        val ry = y / magnitude
+        val rz = z / magnitude
+
+        // Keep a two-second rolling estimate of stationary sensor spread.
+        jitterTimes[jitterIndex] = timestampNanos
+        jitterX[jitterIndex] = rx
+        jitterY[jitterIndex] = ry
+        jitterZ[jitterIndex] = rz
+        jitterIndex = (jitterIndex + 1) % jitterTimes.size
+        jitterCount = min(jitterCount + 1, jitterTimes.size)
+        var sx = 0f; var sy = 0f; var sz = 0f; var n = 0
+        for (i in 0 until jitterCount) {
+            if (timestampNanos - jitterTimes[i] <= 2_000_000_000L) {
+                sx += jitterX[i]; sy += jitterY[i]; sz += jitterZ[i]; n++
+            }
         }
-        previousX = x
-        previousY = y
-        previousZ = z
-        filteredX += (x - filteredX) * 0.22f
-        filteredY += (y - filteredY) * 0.22f
-        filteredZ += (z - filteredZ) * 0.22f
-        gravityX = filteredX
-        gravityY = filteredY
-        gravityZ = filteredZ
+        if (n > 1) {
+            val mx = sx / n; val my = sy / n; val mz = sz / n
+            var variance = 0f
+            for (i in 0 until jitterCount) {
+                if (timestampNanos - jitterTimes[i] <= 2_000_000_000L) {
+                    val dx = jitterX[i] - mx; val dy = jitterY[i] - my; val dz = jitterZ[i] - mz
+                    variance += dx * dx + dy * dy + dz * dz
+                }
+            }
+            gravityJitterG = kotlin.math.sqrt(variance / n)
+        }
+
+        if (!gravityFilterInitialized) {
+            filteredGravityX = rx; filteredGravityY = ry; filteredGravityZ = rz
+            acceptedGravityX = rx; acceptedGravityY = ry; acceptedGravityZ = rz
+            gravityFilterInitialized = true
+            lastSensorTimestamp = timestampNanos
+        } else {
+            val sensorDt = ((timestampNanos - lastSensorTimestamp) / 1_000_000_000f).coerceIn(0.001f, 0.1f)
+            lastSensorTimestamp = timestampNanos
+            val alpha = 1f - kotlin.math.exp(-sensorDt / 0.20f)
+            filteredGravityX += (rx - filteredGravityX) * alpha
+            filteredGravityY += (ry - filteredGravityY) * alpha
+            filteredGravityZ += (rz - filteredGravityZ) * alpha
+            val filteredLength = kotlin.math.sqrt(
+                filteredGravityX * filteredGravityX +
+                filteredGravityY * filteredGravityY +
+                filteredGravityZ * filteredGravityZ
+            ).coerceAtLeast(0.0001f)
+            filteredGravityX /= filteredLength
+            filteredGravityY /= filteredLength
+            filteredGravityZ /= filteredLength
+
+            // Change-based soft dead zone: retain large tilts, suppress tiny sensor chatter.
+            val dx = filteredGravityX - acceptedGravityX
+            val dy = filteredGravityY - acceptedGravityY
+            val dz = filteredGravityZ - acceptedGravityZ
+            val change = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
+            val deadZone = max(0.015f, (gravityJitterG * 1.5f).coerceAtMost(0.05f))
+            if (change > deadZone) {
+                val softFraction = ((change - deadZone) / change).coerceIn(0f, 1f)
+                acceptedGravityX += dx * softFraction
+                acceptedGravityY += dy * softFraction
+                acceptedGravityZ += dz * softFraction
+            }
+        }
+        targetGravityX = acceptedGravityX
+        targetGravityY = acceptedGravityY
+        targetGravityZ = acceptedGravityZ
+    }
+
+    fun setShakeAcceleration(x: Float, y: Float, z: Float, timestampNanos: Long) {
+        val magnitude = kotlin.math.sqrt(x * x + y * y + z * z)
+        val threshold = 1.6f // m/s²; linear-acceleration sensor has gravity removed.
+        if (!magnitude.isFinite() || magnitude <= threshold) return
+        val strength = ((magnitude - threshold) / SensorManager.GRAVITY_EARTH).coerceIn(0f, 1.4f)
+        pendingShakeX = (pendingShakeX - x / SensorManager.GRAVITY_EARTH * 0.16f).coerceIn(-0.35f, 0.35f)
+        pendingShakeZ = (pendingShakeZ + z / SensorManager.GRAVITY_EARTH * 0.16f).coerceIn(-0.35f, 0.35f)
+        fluidSimulation.addImpulse(-x / SensorManager.GRAVITY_EARTH * 0.38f,
+            z / SensorManager.GRAVITY_EARTH * 0.38f)
+        shake = min(1.6f, shake + strength * 0.65f)
     }
 
     override fun onSurfaceCreated(glUnused: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
@@ -378,31 +465,65 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
 
     override fun onDrawFrame(glUnused: javax.microedition.khronos.opengles.GL10?) {
         val now = System.nanoTime()
-        val dt = ((now - lastNanos) / 1_000_000_000f).coerceIn(0f, 0.033f)
+        val dt = ((now - lastNanos) / 1_000_000_000f).coerceIn(0f, 0.05f)
         lastNanos = now
         shake = max(0f, shake - dt * 1.25f)
-        val targetX = (gravityX * 0.82f).coerceIn(-1.15f, 1.15f)
-        val targetZ = (gravityZ * 0.82f).coerceIn(-1.15f, 1.15f)
-        fluidVelocityX += ((targetX - fluidX) * 5.2f - fluidVelocityX * 2.05f) * dt
-        fluidVelocityZ += ((targetZ - fluidZ) * 5.2f - fluidVelocityZ * 2.05f) * dt
-        fluidX = (fluidX + fluidVelocityX * dt).coerceIn(-1.25f, 1.25f)
-        fluidZ = (fluidZ + fluidVelocityZ * dt).coerceIn(-1.25f, 1.25f)
+
+        // A 0.7 Hz damped spring (zeta 0.30) gives the whole gravity vector
+        // physical follow-through. Substeps keep integration stable across frame rates.
+        val targetLength = kotlin.math.sqrt(
+            targetGravityX * targetGravityX + targetGravityY * targetGravityY +
+            targetGravityZ * targetGravityZ
+        ).coerceAtLeast(0.0001f)
+        val targetX = targetGravityX / targetLength * 0.8f
+        val targetY = targetGravityY / targetLength
+        val targetZ = targetGravityZ / targetLength * 0.8f
+        val omega = 2f * Math.PI.toFloat() * 0.7f
+        val dampingRatio = 0.30f
+        val steps = max(1, kotlin.math.ceil(dt / (1f / 120f)).toInt())
+        val stepDt = if (steps > 0) dt / steps else 0f
+        repeat(steps) {
+            springVelocityX += (omega * omega * (targetX - springGravityX) -
+                2f * dampingRatio * omega * springVelocityX) * stepDt
+            springVelocityY += (omega * omega * (targetY - springGravityY) -
+                2f * dampingRatio * omega * springVelocityY) * stepDt
+            springVelocityZ += (omega * omega * (targetZ - springGravityZ) -
+                2f * dampingRatio * omega * springVelocityZ) * stepDt
+            springGravityX += springVelocityX * stepDt
+            springGravityY += springVelocityY * stepDt
+            springGravityZ += springVelocityZ * stepDt
+        }
+        val springLength = kotlin.math.sqrt(
+            springGravityX * springGravityX + springGravityY * springGravityY +
+            springGravityZ * springGravityZ
+        ).coerceAtLeast(0.0001f)
+        springGravityX /= springLength
+        springGravityY /= springLength
+        springGravityZ /= springLength
+
+        // Shake contributes a short momentum kick, never a change to the sensor target.
+        val kickX = pendingShakeX
+        val kickZ = pendingShakeZ
+        pendingShakeX = 0f
+        pendingShakeZ = 0f
+        springVelocityX += kickX
+        springVelocityZ += kickZ
         fluidSimulation.step(dt)
         val time = (now - startNanos) / 1_000_000_000f
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glUseProgram(program)
         GLES30.glUniform1f(timeHandle, time)
-        GLES30.glUniform3f(gravityHandle, fluidX, gravityY, fluidZ)
+        GLES30.glUniform3f(gravityHandle, springGravityX, springGravityY, springGravityZ)
         GLES30.glUniform1f(shakeHandle, shake)
-        val surfaceNormalX = -fluidX
-        val surfaceNormalY = max(0.16f, abs(gravityY))
-        val surfaceNormalZ = -fluidZ
+        val surfaceNormalX = -springGravityX
+        val surfaceNormalY = max(0.16f, abs(springGravityY))
+        val surfaceNormalZ = -springGravityZ
         val rawSurfaceOffset = volumeSolver.offsetForHalfFill(surfaceNormalX, surfaceNormalY, surfaceNormalZ)
         if (rawSurfaceOffset.isFinite()) {
             lastGoodSurfaceOffset = rawSurfaceOffset.coerceIn(-1.5f, 1.5f)
         }
         GLES30.glUniform1f(surfaceOffsetHandle, lastGoodSurfaceOffset)
-        GLES30.glUniform2f(flowHandle, fluidVelocityX, fluidVelocityZ)
+        GLES30.glUniform2f(flowHandle, springVelocityX, springVelocityZ)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, fluidHeightTexture)
         GLES30.glUniform1i(fluidHeightHandle, 0)
@@ -424,8 +545,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         if (now - lastDiagnosticsNanos >= 250_000_000L) {
             lastDiagnosticsNanos = now
             onDiagnostics(
-                "frames: $frameCounter   gravity: %.2f, %.2f, %.2f   offset: %.4f".format(
-                    gravityX, gravityY, gravityZ, lastGoodSurfaceOffset
+                "frames: $frameCounter   jitter: %.3f g   gravity: %.2f, %.2f, %.2f   offset: %.4f".format(
+                    gravityJitterG, springGravityX, springGravityY, springGravityZ, lastGoodSurfaceOffset
                 )
             )
         }
