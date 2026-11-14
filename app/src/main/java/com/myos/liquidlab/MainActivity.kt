@@ -54,7 +54,7 @@ class MainActivity : Activity(), SensorEventListener {
         val ax = event.values[0] / SensorManager.GRAVITY_EARTH
         val ay = event.values[1] / SensorManager.GRAVITY_EARTH
         val az = event.values[2] / SensorManager.GRAVITY_EARTH
-        renderer.setGravity((-ax).coerceIn(-1.35f, 1.35f), ay.coerceIn(-1.35f, 1.35f), az)
+        renderer.setGravity((-ax).coerceIn(-1.35f, 1.35f), ay.coerceIn(-1.35f, 1.35f), az.coerceIn(-1.35f, 1.35f))
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
@@ -63,6 +63,7 @@ class MainActivity : Activity(), SensorEventListener {
 private class LiquidRenderer : GLSurfaceView.Renderer {
     @Volatile private var gravityX = 0f
     @Volatile private var gravityY = 1f
+    @Volatile private var gravityZ = 0f
     @Volatile private var shake = 0f
     @Volatile private var lastMagnitude = 1f
     private var program = 0
@@ -76,6 +77,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
     fun setGravity(x: Float, y: Float, z: Float) {
         gravityX = x
         gravityY = y
+        gravityZ = z
         val magnitude = kotlin.math.sqrt(x * x + y * y + z * z)
         val delta = abs(magnitude - lastMagnitude)
         if (delta > 0.30f) shake = min(1.6f, shake + delta * 1.5f)
@@ -100,7 +102,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
             in vec2 vUv;
             out vec4 fragColor;
             uniform vec2 uResolution;
-            uniform vec2 uGravity;
+            uniform vec3 uGravity;
             uniform float uTime;
             uniform float uShake;
 
@@ -166,7 +168,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
                 vec2 screen = (uv - 0.5) * vec2(aspect, 1.0);
                 vec3 ro = vec3(0.0, 0.0, 3.35);
                 vec3 rd = normalize(vec3(screen * 1.48, -1.85));
-                vec3 g = normalize(vec3(-uGravity.x * 0.78, max(0.22, uGravity.y), 0.0));
+                vec3 g = normalize(uGravity);
                 vec3 background = vec3(0.009, 0.025, 0.038);
                 float halo = exp(-length(screen * vec2(1.1,0.85)) * 3.0);
                 background += vec3(0.015,0.075,0.092) * halo;
@@ -234,7 +236,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glUseProgram(program)
         GLES30.glUniform1f(timeHandle, time)
-        GLES30.glUniform2f(gravityHandle, gravityX, gravityY)
+        GLES30.glUniform3f(gravityHandle, gravityX, gravityY, gravityZ)
         GLES30.glUniform1f(shakeHandle, shake)
         val viewport = IntArray(4)
         GLES30.glGetIntegerv(GLES30.GL_VIEWPORT, viewport, 0)
