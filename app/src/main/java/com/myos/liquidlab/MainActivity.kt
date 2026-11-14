@@ -85,6 +85,8 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
     private var gravityHandle = 0
     private var resolutionHandle = 0
     private var shakeHandle = 0
+    private var surfaceOffsetHandle = 0
+    private val volumeSolver = SurfaceVolumeSolver()
     private var startNanos = 0L
     private var lastNanos = 0L
     private lateinit var vertexBuffer: FloatBuffer
@@ -131,6 +133,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
             uniform vec3 uGravity;
             uniform float uTime;
             uniform float uShake;
+            uniform float uSurfaceOffset;
             uniform vec2 uFlow;
             uniform sampler2D uFluidHeight;
 
@@ -171,7 +174,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
                            + 0.0018 * sin(p.z * 15.0 - uTime * 0.9)
                            + energy * sin(p.x * 10.0 + p.z * 7.0 - uTime * 3.6);
                 float container = sdRoundBox(p, TANK - vec3(0.018), 0.025);
-                float freeSurface = dot(p, n) + 0.055 + wave - simulatedHeight;
+                float freeSurface = dot(p, n) + uSurfaceOffset + wave - simulatedHeight;
                 return max(container, freeSurface);
             }
             vec3 waterNormal(vec3 p, vec3 g) {
@@ -216,14 +219,12 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
                     float fresnel = pow(1.0 - max(dot(n, viewDir), 0.0), 4.0);
                     float diffuse = max(dot(n, lightDir), 0.0);
                     float thickness = clamp((hit.y + TANK.y) / (2.0 * TANK.y), 0.0, 1.0);
-                    float caustic = pow(max(0.0, 1.0 - abs(noise(hit * vec3(27.0,34.0,31.0) + vec3(uTime*0.15,-uTime*0.11,uTime*0.13)) - 0.5) * 2.0), 5.0);
                     vec3 deep = vec3(0.004, 0.075, 0.105);
                     vec3 body = mix(vec3(0.012,0.27,0.34), deep, 0.35 + thickness * 0.48);
-                    body += vec3(0.08,0.32,0.30) * caustic * 0.32;
                     float spec = pow(max(dot(reflect(-lightDir,n),viewDir),0.0), 72.0);
                     float surfaceFactor = smoothstep(0.72,0.96,n.y);
                     vec3 surfaceColor = vec3(0.025,0.38,0.43) + vec3(0.30,0.48,0.45)*diffuse;
-                    surfaceColor += vec3(0.72,0.92,0.92)*(spec*1.25 + fresnel*0.42);
+                    surfaceColor += vec3(0.72,0.92,0.92)*(spec*0.72 + fresnel*0.34);
                     color = mix(body, surfaceColor, surfaceFactor);
                     color += vec3(0.35,0.76,0.78) * fresnel * 0.18;
                 }
@@ -254,6 +255,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         gravityHandle = GLES30.glGetUniformLocation(program, "uGravity")
         resolutionHandle = GLES30.glGetUniformLocation(program, "uResolution")
         shakeHandle = GLES30.glGetUniformLocation(program, "uShake")
+        surfaceOffsetHandle = GLES30.glGetUniformLocation(program, "uSurfaceOffset")
         flowHandle = GLES30.glGetUniformLocation(program, "uFlow")
         fluidHeightHandle = GLES30.glGetUniformLocation(program, "uFluidHeight")
         val textureIds = IntArray(1)
@@ -293,6 +295,11 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         GLES30.glUniform1f(timeHandle, time)
         GLES30.glUniform3f(gravityHandle, fluidX, gravityY, fluidZ)
         GLES30.glUniform1f(shakeHandle, shake)
+        val surfaceNormalX = -fluidX
+        val surfaceNormalY = max(0.16f, abs(gravityY))
+        val surfaceNormalZ = -fluidZ
+        val surfaceOffset = volumeSolver.offsetForHalfFill(surfaceNormalX, surfaceNormalY, surfaceNormalZ)
+        GLES30.glUniform1f(surfaceOffsetHandle, surfaceOffset)
         GLES30.glUniform2f(flowHandle, fluidVelocityX, fluidVelocityZ)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, fluidHeightTexture)
