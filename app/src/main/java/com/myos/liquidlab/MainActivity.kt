@@ -143,8 +143,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     private val computedUp = FloatArray(3)
     private var neutralGravityX = 0f
     private var neutralGravityZ = 0f
-    private var eyeX = 0f
-    private var eyeY = 0f
+    @Volatile private var eyeX = 0f
+    @Volatile private var eyeY = 0f
     private var eyeFilterInitialized = false
     private var lastEyeTimestamp = 0L
     private var frameCounter = 0L
@@ -430,7 +430,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 // directions so refracted rays with positive Z never divide by zero.
                 float backdropDenom = abs(rd.z) < 0.001
                     ? (rd.z < 0.0 ? -0.001 : 0.001) : rd.z;
-                float backdropT = (-0.80 - ro.z) / backdropDenom;
+                float backdropZ = rd.z < 0.0 ? -0.80 : 0.80;
+                float backdropT = (backdropZ - ro.z) / backdropDenom;
                 vec3 backdropPoint = ro + rd * max(backdropT, 0.0);
                 float gridFine = 1.0 - smoothstep(0.04, 0.10,
                     min(abs(fract(backdropPoint.x * 5.0) - 0.5),
