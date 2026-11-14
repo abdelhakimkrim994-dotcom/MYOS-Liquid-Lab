@@ -424,15 +424,12 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                     float viewAlignment = dot(up, viewDir);
                     if (viewAlignment > 0.82) {
                         vec3 innerHalf = TANK - vec3(0.018);
-                        vec3 safeRd = mix(vec3(0.0001), rd, greaterThan(abs(rd), vec3(0.0001)));
-                        vec3 tToWall = vec3(
-                            rd.x > 0.0 ? ( innerHalf.x - hit.x) / safeRd.x : (-innerHalf.x - hit.x) / safeRd.x,
-                            rd.y > 0.0 ? ( innerHalf.y - hit.y) / safeRd.y : (-innerHalf.y - hit.y) / safeRd.y,
-                            rd.z > 0.0 ? ( innerHalf.z - hit.z) / safeRd.z : (-innerHalf.z - hit.z) / safeRd.z
-                        );
-                        float tx = rd.x == 0.0 ? 1e4 : tToWall.x;
-                        float ty = rd.y == 0.0 ? 1e4 : tToWall.y;
-                        float tz = rd.z == 0.0 ? 1e4 : tToWall.z;
+                        float tx = abs(rd.x) < 0.0001 ? 1e4 :
+                            (rd.x > 0.0 ? (innerHalf.x - hit.x) / rd.x : (-innerHalf.x - hit.x) / rd.x);
+                        float ty = abs(rd.y) < 0.0001 ? 1e4 :
+                            (rd.y > 0.0 ? (innerHalf.y - hit.y) / rd.y : (-innerHalf.y - hit.y) / rd.y);
+                        float tz = abs(rd.z) < 0.0001 ? 1e4 :
+                            (rd.z > 0.0 ? (innerHalf.z - hit.z) / rd.z : (-innerHalf.z - hit.z) / rd.z);
                         float exitT = min(tx, min(ty, tz));
                         if (exitT > 0.0 && exitT < 2.0) {
                             vec3 backPoint = hit + rd * exitT;
