@@ -42,7 +42,11 @@ internal class FluidSurfaceSimulation(private val size: Int = 40) {
 
     @Synchronized
     fun step(deltaSeconds: Float) {
-        accumulator = min(accumulator + deltaSeconds.coerceIn(0f, 0.04f), fixedStep * 4f)
+        if (!deltaSeconds.isFinite()) {
+            reset()
+            return
+        }
+        accumulator = min(accumulator + deltaSeconds.coerceIn(0f, 0.033f), fixedStep * 4f)
         var steps = 0
         while (accumulator >= fixedStep && steps < 4) {
             simulate(fixedStep)
@@ -156,6 +160,31 @@ internal class FluidSurfaceSimulation(private val size: Int = 40) {
         for (value in height) sum += value
         val correction = sum / count
         for (i in height.indices) height[i] -= correction
+
+        // Last-line defence: one invalid cell must not poison the whole rendered surface.
+        for (i in height.indices) {
+            if (!height[i].isFinite() || !velocityX[i].isFinite() || !velocityZ[i].isFinite()) {
+                reset()
+                return
+            }
+            velocityX[i] = velocityX[i].coerceIn(-1f, 1f)
+            velocityZ[i] = velocityZ[i].coerceIn(-1f, 1f)
+            height[i] = height[i].coerceIn(-0.045f, 0.045f)
+        }
+    }
+
+    @Synchronized
+    private fun reset() {
+        height.fill(0f)
+        nextHeight.fill(0f)
+        smoothHeight.fill(0f)
+        velocityX.fill(0f)
+        velocityZ.fill(0f)
+        nextVelocityX.fill(0f)
+        nextVelocityZ.fill(0f)
+        accumulator = 0f
+        impulseX = 0f
+        impulseZ = 0f
     }
 
     @Synchronized
