@@ -166,7 +166,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
                 vec2 screen = (uv - 0.5) * vec2(aspect, 1.0);
                 vec3 ro = vec3(0.0, 0.0, 3.35);
                 vec3 rd = normalize(vec3(screen * 1.48, -1.85));
-                vec3 g = normalize(vec3(uGravity.x * 0.78, max(0.22, uGravity.y), uGravity.x * 0.0 + uGravity.y * 0.78));
+                vec3 g = normalize(vec3(-uGravity.x * 0.78, max(0.22, uGravity.y), 0.0));
                 vec3 background = vec3(0.009, 0.025, 0.038);
                 float halo = exp(-length(screen * vec2(1.1,0.85)) * 3.0);
                 background += vec3(0.015,0.075,0.092) * halo;
