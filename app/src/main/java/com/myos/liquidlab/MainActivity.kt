@@ -69,6 +69,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
     private var timeHandle = 0
     private var gravityHandle = 0
     private var resolutionHandle = 0
+    private var kickHandle = 0
     private lateinit var vertices: FloatBuffer
     private var startNanos = 0L
     private var lastNanos = 0L
@@ -159,6 +160,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         timeHandle = GLES30.glGetUniformLocation(program, "uTime")
         gravityHandle = GLES30.glGetUniformLocation(program, "uGravity")
         resolutionHandle = GLES30.glGetUniformLocation(program, "uResolution")
+        kickHandle = GLES30.glGetUniformLocation(program, "uKick")
         startNanos = System.nanoTime()
         lastNanos = startNanos
     }
@@ -177,6 +179,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         GLES30.glUseProgram(program)
         GLES30.glUniform1f(timeHandle,t)
         GLES30.glUniform2f(gravityHandle,gravityX,gravityY)
+        GLES30.glUniform1f(kickHandle,kick)
         val viewport=IntArray(4)
         GLES30.glGetIntegerv(GLES30.GL_VIEWPORT,viewport,0)
         GLES30.glUniform2f(resolutionHandle,viewport[2].toFloat(),viewport[3].toFloat())
