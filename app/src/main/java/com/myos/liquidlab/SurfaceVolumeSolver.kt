@@ -79,7 +79,9 @@ internal class SurfaceVolumeSolver(
                 i += 3
             }
             val fill = below.toFloat() / (samples.size / 3)
-            if (fill < targetFill) low = mid else high = mid
+            // Increasing the offset raises the plane and decreases the
+            // clipped water volume. Too much water therefore means raise it.
+            if (fill > targetFill) low = mid else high = mid
         }
         val result = (low + high) * 0.5f
         return if (result.isFinite()) result.coerceIn(-1.5f, 1.5f) else 0f
