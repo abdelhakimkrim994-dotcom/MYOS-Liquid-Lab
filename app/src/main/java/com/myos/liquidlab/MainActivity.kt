@@ -76,8 +76,9 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
     private var fluidZ = 0f
     private var fluidVelocityX = 0f
     private var fluidVelocityZ = 0f
-    @Volatile private var pendingImpulseX = 0f
-    @Volatile private var pendingImpulseZ = 0f
+    private val fluidSimulation = FluidSurfaceSimulation()
+    private var fluidHeightTexture = 0
+    private var fluidHeightHandle = 0
     private var flowHandle = 0
     private var program = 0
     private var timeHandle = 0
@@ -96,8 +97,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         val motion = kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
         if (motion > 0.035f) {
             shake = min(1.6f, shake + motion * 0.92f)
-            pendingImpulseX += (x - previousX) * 0.48f
-            pendingImpulseZ += (z - previousZ) * 0.48f
+            fluidSimulation.addImpulse((x - previousX) * 0.82f, (z - previousZ) * 0.82f)
         }
         previousX = x
         previousY = y
@@ -132,6 +132,7 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
             uniform float uTime;
             uniform float uShake;
             uniform vec2 uFlow;
+            uniform sampler2D uFluidHeight;
 
             const vec3 TANK = vec3(0.405, 0.885, 0.305);
             float hash(vec3 p) {
@@ -163,11 +164,14 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
             float waterDistance(vec3 p, vec3 g) {
                 vec3 n = normalize(vec3(-g.x, max(0.16, abs(g.y)), -g.z));
                 float energy = clamp(length(uFlow) * 0.018 + uShake * 0.008, 0.0, 0.032);
-                float wave = 0.004 * sin(p.x * 11.0 + uTime * 1.4)
-                           + 0.003 * sin(p.z * 15.0 - uTime * 1.1)
-                           + energy * sin(p.x * 10.0 + p.z * 7.0 - uTime * 4.2);
+                vec2 fluidUv = clamp(vec2(p.x / (2.0 * TANK.x) + 0.5,
+                                          p.z / (2.0 * TANK.z) + 0.5), 0.0, 1.0);
+                float simulatedHeight = texture(uFluidHeight, fluidUv).r;
+                float wave = 0.0025 * sin(p.x * 11.0 + uTime * 1.1)
+                           + 0.0018 * sin(p.z * 15.0 - uTime * 0.9)
+                           + energy * sin(p.x * 10.0 + p.z * 7.0 - uTime * 3.6);
                 float container = sdRoundBox(p, TANK - vec3(0.018), 0.025);
-                float freeSurface = dot(p, n) + 0.055 + wave;
+                float freeSurface = dot(p, n) + 0.055 + wave - simulatedHeight;
                 return max(container, freeSurface);
             }
             vec3 waterNormal(vec3 p, vec3 g) {
@@ -251,6 +255,18 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         resolutionHandle = GLES30.glGetUniformLocation(program, "uResolution")
         shakeHandle = GLES30.glGetUniformLocation(program, "uShake")
         flowHandle = GLES30.glGetUniformLocation(program, "uFlow")
+        fluidHeightHandle = GLES30.glGetUniformLocation(program, "uFluidHeight")
+        val textureIds = IntArray(1)
+        GLES30.glGenTextures(1, textureIds, 0)
+        fluidHeightTexture = textureIds[0]
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, fluidHeightTexture)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        val gridSize = fluidSimulation.resolution()
+        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_R32F, gridSize, gridSize, 0,
+            GLES30.GL_RED, GLES30.GL_FLOAT, null)
         startNanos = System.nanoTime()
         lastNanos = startNanos
     }
@@ -264,16 +280,13 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         val dt = ((now - lastNanos) / 1_000_000_000f).coerceIn(0f, 0.04f)
         lastNanos = now
         shake = max(0f, shake - dt * 1.25f)
-        fluidVelocityX += pendingImpulseX
-        fluidVelocityZ += pendingImpulseZ
-        pendingImpulseX = 0f
-        pendingImpulseZ = 0f
         val targetX = (gravityX * 0.82f).coerceIn(-1.15f, 1.15f)
         val targetZ = (gravityZ * 0.82f).coerceIn(-1.15f, 1.15f)
         fluidVelocityX += ((targetX - fluidX) * 5.2f - fluidVelocityX * 2.05f) * dt
         fluidVelocityZ += ((targetZ - fluidZ) * 5.2f - fluidVelocityZ * 2.05f) * dt
         fluidX = (fluidX + fluidVelocityX * dt).coerceIn(-1.25f, 1.25f)
         fluidZ = (fluidZ + fluidVelocityZ * dt).coerceIn(-1.25f, 1.25f)
+        fluidSimulation.step(dt)
         val time = (now - startNanos) / 1_000_000_000f
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glUseProgram(program)
@@ -281,6 +294,14 @@ private class LiquidRenderer : GLSurfaceView.Renderer {
         GLES30.glUniform3f(gravityHandle, fluidX, gravityY, fluidZ)
         GLES30.glUniform1f(shakeHandle, shake)
         GLES30.glUniform2f(flowHandle, fluidVelocityX, fluidVelocityZ)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, fluidHeightTexture)
+        GLES30.glUniform1i(fluidHeightHandle, 0)
+        val heightData = fluidSimulation.createUploadBuffer()
+        fluidSimulation.writeHeightTexture(heightData)
+        val gridSize = fluidSimulation.resolution()
+        GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, gridSize, gridSize,
+            GLES30.GL_RED, GLES30.GL_FLOAT, heightData)
         val viewport = IntArray(4)
         GLES30.glGetIntegerv(GLES30.GL_VIEWPORT, viewport, 0)
         GLES30.glUniform2f(resolutionHandle, viewport[2].toFloat(), viewport[3].toFloat())
