@@ -176,13 +176,41 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                            mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
                                mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
             }
-            float causticPattern(vec3 p) {
-                vec2 q = p.xz * vec2(8.5, 10.5);
-                q += vec2(sin(p.z * 5.0 + uTime * 0.55),
+            float causticPattern(vec2 p) {
+                vec2 q = p * vec2(8.5, 10.5);
+                q += vec2(sin(p.y * 5.0 + uTime * 0.55),
                           cos(p.x * 4.0 - uTime * 0.48)) * 0.24;
                 float a = sin(q.x * 1.65 + sin(q.y * 1.25 + uTime * 0.82));
                 float b = sin(q.y * 1.85 - sin(q.x * 1.35 - uTime * 0.68));
                 return pow(clamp(1.0 - abs(a * b), 0.0, 1.0), 8.0);
+            }
+            float triCaustics(vec3 p, vec3 n) {
+                vec3 w = pow(abs(n), vec3(4.0));
+                w /= max(w.x + w.y + w.z, 0.0001);
+                return causticPattern(p.zy) * w.x
+                     + causticPattern(p.xz) * w.y
+                     + causticPattern(p.xy) * w.z;
+            }
+            float bubbles(vec2 p, float t) {
+                float acc = 0.0;
+                for (int i = 0; i < 3; i++) {
+                    float fi = float(i);
+                    vec2 q = p * (5.0 + fi * 4.0);
+                    q.y -= t * (0.30 + 0.14 * fi);
+                    vec2 id = floor(q);
+                    vec2 f = fract(q) - 0.5;
+                    float h = hash(vec3(id, fi));
+                    if (h > 0.45) {
+                        vec2 off = (vec2(h, fract(h * 7.13)) - 0.5) * 0.4;
+                        float r = 0.10 + 0.08 * fract(h * 3.7);
+                        float d = length(f - off);
+                        float ring = 1.0 - smoothstep(r - 0.025, r, d);
+                        float glimmer = 1.0 - smoothstep(0.0, 0.03,
+                            length(f - off - vec2(-r * 0.35, r * 0.35)));
+                        acc += ring + glimmer * 0.8;
+                    }
+                }
+                return clamp(acc, 0.0, 1.0);
             }
             float sdRoundBox(vec3 p, vec3 b, float r) {
                 vec3 q = abs(p) - b + r;
@@ -247,29 +275,55 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 vec3 color = background;
                 if (traceWater(ro, rd, g, hit, travel)) {
                     vec3 n = waterNormal(hit, g);
+                    vec3 up = normalize(vec3(-g.x, max(0.16, abs(g.y)), -g.z));
                     vec3 viewDir = normalize(ro - hit);
                     vec3 lightDir = normalize(vec3(-0.45, 0.78, 0.62));
-                    float fresnel = pow(1.0 - max(dot(n, viewDir), 0.0), 4.0);
-                    float diffuse = max(dot(n, lightDir), 0.0);
-                    float depth = clamp((hit.y + TANK.y) / (2.0 * TANK.y), 0.0, 1.0);
-                    // Saturated, layered colour gives the water a playful 3D glass-candy look.
-                    vec3 deepBlue = vec3(0.006, 0.105, 0.205);
-                    vec3 oceanTeal = vec3(0.012, 0.36, 0.49);
-                    vec3 sunlitAqua = vec3(0.075, 0.66, 0.70);
-                    vec3 body = mix(deepBlue, oceanTeal, smoothstep(0.04, 0.88, depth));
-                    body = mix(body, sunlitAqua, smoothstep(0.70, 1.0, depth) * 0.46);
-                    float caustics = causticPattern(hit);
-                    float softGlow = 0.5 + 0.5 * sin(hit.x * 5.5 + hit.z * 4.0 - uTime * 0.7);
-                    body += vec3(0.035, 0.20, 0.22) * caustics * (0.32 + 0.24 * softGlow);
-                    float spec = pow(max(dot(reflect(-lightDir,n),viewDir),0.0), 46.0);
-                    float sharpSpec = pow(max(dot(reflect(-lightDir,n),viewDir),0.0), 110.0);
-                    float surfaceFactor = smoothstep(0.66,0.95,n.y);
-                    vec3 surfaceColor = vec3(0.018,0.43,0.51) + vec3(0.12,0.35,0.34)*diffuse;
-                    float flowingRibbon = pow(max(0.0, sin(hit.x * 17.0 + hit.z * 8.0 - uTime * 1.35)), 13.0);
-                    surfaceColor += vec3(0.08,0.28,0.28) * flowingRibbon;
-                    surfaceColor += vec3(0.62,0.91,0.92) * (spec * 0.55 + sharpSpec * 0.85 + fresnel * 0.30);
-                    color = mix(body, surfaceColor, surfaceFactor);
-                    color += vec3(0.18,0.72,0.80) * fresnel * 0.22;
+
+                    // Signed distance from the gravity-aligned free surface.
+                    // Negative values are below the surface and remain correct while tilted.
+                    float s = dot(hit, up) + uSurfaceOffset;
+                    float below = clamp(-s * 1.15, 0.0, 1.0);
+
+                    // Ocean turquoise -> clear aqua -> deep indigo, with depth tied to the plane.
+                    vec3 shallow = vec3(0.19, 0.78, 0.69);
+                    vec3 tropical = vec3(0.035, 0.43, 0.57);
+                    vec3 deep = vec3(0.055, 0.16, 0.39);
+                    vec3 body = mix(shallow, tropical, smoothstep(0.0, 0.38, below));
+                    body = mix(body, deep, smoothstep(0.32, 1.0, below));
+
+                    float diff = max(dot(n, lightDir), 0.0);
+                    float band = 0.5 * smoothstep(0.15, 0.20, diff)
+                               + 0.5 * smoothstep(0.55, 0.60, diff);
+                    body *= 0.76 + 0.30 * band;
+
+                    // Tri-planar projection prevents streaks on vertical tank faces.
+                    float caustics = triCaustics(hit, n);
+                    vec3 seaGlass = vec3(0.30, 0.77, 0.68);
+                    vec3 warmSandLight = vec3(0.72, 0.78, 0.57);
+                    body += mix(seaGlass, warmSandLight, 0.16) *
+                            caustics * 0.27 * (1.0 - below * 0.58);
+
+                    float bubbleMask = bubbles(hit.xy, uTime);
+                    body += vec3(0.68, 0.91, 0.88) * bubbleMask *
+                            0.42 * smoothstep(0.30, 0.80, n.z);
+
+                    float rimLight = pow(1.0 - max(dot(n, viewDir), 0.0), 2.5);
+                    body += vec3(0.20, 0.58, 0.68) * rimLight * 0.20;
+
+                    float surfaceFactor = smoothstep(0.66, 0.95, dot(n, up));
+                    vec3 top = mix(vec3(0.25, 0.78, 0.72),
+                                   vec3(0.68, 0.91, 0.83), diff * 0.58);
+                    float reflected = max(dot(reflect(-lightDir, n), viewDir), 0.0);
+                    float glint = step(0.965, reflected);
+                    top += vec3(0.72, 0.88, 0.76) * glint * 0.34;
+
+                    color = mix(body, top, surfaceFactor);
+
+                    // Thin warm-ivory meniscus where the water meets the glass.
+                    float foam = 1.0 - smoothstep(0.006, 0.026, abs(s));
+                    float sideFace = 1.0 - surfaceFactor;
+                    color = mix(color, vec3(0.83, 0.91, 0.78),
+                                foam * 0.62 * sideFace);
                 }
 
                 // Glass vessel: rounded silhouette, bright polished edges and front-face reflections.
@@ -286,6 +340,8 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 color += vec3(0.52,0.78,0.82) * topGlare * 0.25;
                 float vignette = smoothstep(1.05,0.25,length(screen*vec2(0.85,0.72)));
                 color *= 0.72 + 0.28*vignette;
+                // Gentle exponential tone mapping keeps highlights bright without clipping.
+                color = 1.0 - exp(-max(color, vec3(0.0)) * 1.35);
                 fragColor = vec4(color,1.0);
             }
         """.trimIndent()
