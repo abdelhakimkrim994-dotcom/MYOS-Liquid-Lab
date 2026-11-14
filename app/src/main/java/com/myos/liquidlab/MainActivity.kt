@@ -480,7 +480,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val targetZ = targetGravityZ / targetLength * 0.8f
         val omega = 2f * Math.PI.toFloat() * 0.7f
         val dampingRatio = 0.30f
-        val steps = max(1, kotlin.math.ceil(dt / (1f / 120f)).toInt())
+        val steps = max(1, kotlin.math.ceil(dt.toDouble() / (1.0 / 120.0)).toInt())
         val stepDt = if (steps > 0) dt / steps else 0f
         repeat(steps) {
             springVelocityX += (omega * omega * (targetX - springGravityX) -
