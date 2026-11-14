@@ -17,6 +17,7 @@ internal class SurfaceVolumeSolver(
     private val samples: FloatArray
 
     init {
+        require(resolution >= 2)
         val points = ArrayList<Float>(resolution * resolution * resolution * 3)
         val bx = 0.387f
         val by = 0.867f
@@ -47,26 +48,32 @@ internal class SurfaceVolumeSolver(
     }
 
     fun offsetForHalfFill(nx: Float, ny: Float, nz: Float): Float {
-        val length = sqrt(nx * nx + ny * ny + nz * nz).coerceAtLeast(0.0001f)
+        // A malformed normal must never poison the shader uniform.
+        if (samples.size < 3 || !nx.isFinite() || !ny.isFinite() || !nz.isFinite()) return 0f
+        val lengthSquared = nx * nx + ny * ny + nz * nz
+        if (!lengthSquared.isFinite() || lengthSquared < 1e-8f) return 0f
+        val length = sqrt(lengthSquared)
         val x = nx / length
         val y = ny / length
         val z = nz / length
         var minProjection = Float.POSITIVE_INFINITY
         var maxProjection = Float.NEGATIVE_INFINITY
         var i = 0
-        while (i < samples.size) {
+        while (i + 2 < samples.size) {
             val projection = samples[i] * x + samples[i + 1] * y + samples[i + 2] * z
+            if (!projection.isFinite()) return 0f
             minProjection = min(minProjection, projection)
             maxProjection = max(maxProjection, projection)
             i += 3
         }
+        if (!minProjection.isFinite() || !maxProjection.isFinite() || minProjection > maxProjection) return 0f
         var low = -maxProjection
         var high = -minProjection
-        repeat(16) {
+        repeat(18) {
             val mid = (low + high) * 0.5f
             var below = 0
             i = 0
-            while (i < samples.size) {
+            while (i + 2 < samples.size) {
                 val projection = samples[i] * x + samples[i + 1] * y + samples[i + 2] * z + mid
                 if (projection <= 0f) below++
                 i += 3
@@ -74,6 +81,7 @@ internal class SurfaceVolumeSolver(
             val fill = below.toFloat() / (samples.size / 3)
             if (fill < targetFill) low = mid else high = mid
         }
-        return (low + high) * 0.5f
+        val result = (low + high) * 0.5f
+        return if (result.isFinite()) result.coerceIn(-1.5f, 1.5f) else 0f
     }
 }
