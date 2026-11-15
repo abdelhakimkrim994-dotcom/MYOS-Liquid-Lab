@@ -128,6 +128,14 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     private var springVelocityZ = 0f
     private val fluidSimulation = FluidSurfaceSimulation()
     private var fluidHeightTexture = 0
+    // Render the optics pass below native resolution, then upscale once.
+    private var sceneFramebuffer = 0
+    private var sceneColorTexture = 0
+    private var sceneWidth = 1
+    private var sceneHeight = 1
+    private var surfaceWidth = 1
+    private var surfaceHeight = 1
+    private var sceneFramebufferReady = false
     private var fluidHeightHandle = 0
     private var flowHandle = 0
     private var program = 0
@@ -269,6 +277,10 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     override fun onSurfaceCreated(glUnused: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
         GLES30.glClearColor(0.008f, 0.018f, 0.027f, 1f)
         GLES30.glDisable(GLES30.GL_DEPTH_TEST)
+        // GL objects are recreated whenever Android recreates the EGL context.
+        sceneFramebuffer = 0
+        sceneColorTexture = 0
+        sceneFramebufferReady = false
         val vertex = """
             #version 300 es
             layout(location=0) in vec2 aPosition;
@@ -405,7 +417,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
             }
             bool traceWater(vec3 ro, vec3 rd, vec3 up, out vec3 hit, out float travel) {
                 travel = 0.0;
-                for (int i = 0; i < 88; i++) {
+                for (int i = 0; i < 64; i++) {
                     vec3 p = ro + rd * travel;
                     float d = waterDistance(p, up);
                     if (d < 0.0018) { hit = p; return true; }
@@ -733,7 +745,38 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     }
 
     override fun onSurfaceChanged(glUnused: javax.microedition.khronos.opengles.GL10?, width: Int, height: Int) {
-        GLES30.glViewport(0, 0, width, height)
+        surfaceWidth = width.coerceAtLeast(1)
+        surfaceHeight = height.coerceAtLeast(1)
+        // 85% on each axis preserves the aspect ratio and shades ~72% as many pixels.
+        sceneWidth = (surfaceWidth * 0.85f).toInt().coerceAtLeast(1)
+        sceneHeight = (surfaceHeight * 0.85f).toInt().coerceAtLeast(1)
+
+        if (sceneFramebuffer == 0) {
+            val ids = IntArray(1)
+            GLES30.glGenFramebuffers(1, ids, 0)
+            sceneFramebuffer = ids[0]
+        }
+        if (sceneColorTexture == 0) {
+            val ids = IntArray(1)
+            GLES30.glGenTextures(1, ids, 0)
+            sceneColorTexture = ids[0]
+        }
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sceneColorTexture)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8,
+            sceneWidth, sceneHeight, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, sceneFramebuffer)
+        GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
+            GLES30.GL_TEXTURE_2D, sceneColorTexture, 0)
+        sceneFramebufferReady =
+            GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER) == GLES30.GL_FRAMEBUFFER_COMPLETE
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        GLES30.glViewport(0, 0, surfaceWidth, surfaceHeight)
     }
 
     override fun onDrawFrame(glUnused: javax.microedition.khronos.opengles.GL10?) {
@@ -789,8 +832,15 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         springVelocityZ += kickZ
         fluidSimulation.step(dt)
         val time = (now - startNanos) / 1_000_000_000f
-        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         if (program == 0) return
+        if (sceneFramebufferReady) {
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, sceneFramebuffer)
+            GLES30.glViewport(0, 0, sceneWidth, sceneHeight)
+        } else {
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+            GLES30.glViewport(0, 0, surfaceWidth, surfaceHeight)
+        }
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glUseProgram(program)
         val up = computeUp(springGravityX, springGravityY, springGravityZ)
         GLES30.glUniform1f(timeHandle, time)
@@ -811,14 +861,27 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val gridSize = fluidSimulation.resolution()
         GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, gridSize, gridSize,
             GLES30.GL_RED, GLES30.GL_FLOAT, heightData)
-        val viewport = IntArray(4)
-        GLES30.glGetIntegerv(GLES30.GL_VIEWPORT, viewport, 0)
-        GLES30.glUniform2f(resolutionHandle, viewport[2].toFloat(), viewport[3].toFloat())
+        val renderWidth = if (sceneFramebufferReady) sceneWidth else surfaceWidth
+        val renderHeight = if (sceneFramebufferReady) sceneHeight else surfaceHeight
+        GLES30.glUniform2f(resolutionHandle, renderWidth.toFloat(), renderHeight.toFloat())
         vertexBuffer.position(0)
         GLES30.glEnableVertexAttribArray(0)
         GLES30.glVertexAttribPointer(0, 2, GLES30.GL_FLOAT, false, 0, vertexBuffer)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
         GLES30.glDisableVertexAttribArray(0)
+
+        // Upscale the completed scene in one hardware blit; no extra shader pass.
+        if (sceneFramebufferReady) {
+            GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, sceneFramebuffer)
+            GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER, 0)
+            GLES30.glBlitFramebuffer(
+                0, 0, sceneWidth, sceneHeight,
+                0, 0, surfaceWidth, surfaceHeight,
+                GLES30.GL_COLOR_BUFFER_BIT, GLES30.GL_LINEAR
+            )
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+            GLES30.glViewport(0, 0, surfaceWidth, surfaceHeight)
+        }
 
         frameCounter++
         if (now - lastDiagnosticsNanos >= 250_000_000L) {
