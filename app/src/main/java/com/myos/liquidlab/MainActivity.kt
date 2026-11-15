@@ -102,9 +102,10 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     @Volatile private var rawSensorX = 0f
     @Volatile private var rawSensorY = 0f
     @Volatile private var rawSensorZ = 0f
-    @Volatile private var shake = 0f
-    @Volatile private var pendingShakeX = 0f
-    @Volatile private var pendingShakeZ = 0f
+    private val shakeLock = Any()
+    private var shake = 0f
+    private var pendingShakeX = 0f
+    private var pendingShakeZ = 0f
     private var filteredGravityX = 0f
     private var filteredGravityY = 1f
     private var filteredGravityZ = 0f
@@ -127,6 +128,14 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     private var springVelocityZ = 0f
     private val fluidSimulation = FluidSurfaceSimulation()
     private var fluidHeightTexture = 0
+    // Render the optics pass below native resolution, then upscale once.
+    private var sceneFramebuffer = 0
+    private var sceneColorTexture = 0
+    private var sceneWidth = 1
+    private var sceneHeight = 1
+    private var surfaceWidth = 1
+    private var surfaceHeight = 1
+    private var sceneFramebufferReady = false
     private var fluidHeightHandle = 0
     private var flowHandle = 0
     private var program = 0
@@ -256,16 +265,22 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val threshold = 1.6f // m/s²; linear-acceleration sensor has gravity removed.
         if (!magnitude.isFinite() || magnitude <= threshold) return
         val strength = ((magnitude - threshold) / SensorManager.GRAVITY_EARTH).coerceIn(0f, 1.4f)
-        pendingShakeX = (pendingShakeX - x / SensorManager.GRAVITY_EARTH * 0.16f).coerceIn(-0.35f, 0.35f)
-        pendingShakeZ = (pendingShakeZ + z / SensorManager.GRAVITY_EARTH * 0.16f).coerceIn(-0.35f, 0.35f)
+        synchronized(shakeLock) {
+            pendingShakeX = (pendingShakeX - x / SensorManager.GRAVITY_EARTH * 0.16f).coerceIn(-0.35f, 0.35f)
+            pendingShakeZ = (pendingShakeZ + z / SensorManager.GRAVITY_EARTH * 0.16f).coerceIn(-0.35f, 0.35f)
+            shake = min(1.6f, shake + strength * 0.65f)
+        }
         fluidSimulation.addImpulse(-x / SensorManager.GRAVITY_EARTH * 0.38f,
             z / SensorManager.GRAVITY_EARTH * 0.38f)
-        shake = min(1.6f, shake + strength * 0.65f)
     }
 
     override fun onSurfaceCreated(glUnused: javax.microedition.khronos.opengles.GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
         GLES30.glClearColor(0.008f, 0.018f, 0.027f, 1f)
         GLES30.glDisable(GLES30.GL_DEPTH_TEST)
+        // GL objects are recreated whenever Android recreates the EGL context.
+        sceneFramebuffer = 0
+        sceneColorTexture = 0
+        sceneFramebufferReady = false
         val vertex = """
             #version 300 es
             layout(location=0) in vec2 aPosition;
@@ -402,7 +417,7 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
             }
             bool traceWater(vec3 ro, vec3 rd, vec3 up, out vec3 hit, out float travel) {
                 travel = 0.0;
-                for (int i = 0; i < 88; i++) {
+                for (int i = 0; i < 64; i++) {
                     vec3 p = ro + rd * travel;
                     float d = waterDistance(p, up);
                     if (d < 0.0018) { hit = p; return true; }
@@ -411,6 +426,95 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 }
                 hit = vec3(0.0);
                 return false;
+            }
+            // All exit candidates are forward intersections with the bounded
+            // inner tank. Near-parallel axes are skipped instead of divided by.
+            bool insideExitBounds(vec3 p, vec3 wb) {
+                return all(lessThanEqual(abs(p), wb + vec3(0.0025)));
+            }
+            bool exitBox(vec3 p, vec3 r, vec3 wb,
+                         out float tOut, out vec3 nOut) {
+                const float EPS = 0.00001;
+                const float HIT_EPS = 0.0001;
+                tOut = 1e9;
+                nOut = vec3(0.0);
+                if (!insideExitBounds(p, wb)) return false;
+
+                if (abs(r.x) > EPS) {
+                    float t = (sign(r.x) * wb.x - p.x) / r.x;
+                    vec3 q = p + r * t;
+                    if (t > HIT_EPS && t < tOut && insideExitBounds(q, wb)) {
+                        tOut = t; nOut = vec3(sign(r.x), 0.0, 0.0);
+                    }
+                }
+                if (abs(r.y) > EPS) {
+                    float t = (sign(r.y) * wb.y - p.y) / r.y;
+                    vec3 q = p + r * t;
+                    if (t > HIT_EPS && t < tOut && insideExitBounds(q, wb)) {
+                        tOut = t; nOut = vec3(0.0, sign(r.y), 0.0);
+                    }
+                }
+                if (abs(r.z) > EPS) {
+                    float t = (sign(r.z) * wb.z - p.z) / r.z;
+                    vec3 q = p + r * t;
+                    if (t > HIT_EPS && t < tOut && insideExitBounds(q, wb)) {
+                        tOut = t; nOut = vec3(0.0, 0.0, sign(r.z));
+                    }
+                }
+                return tOut < 1e8 && dot(nOut, nOut) > 0.5;
+            }
+            bool exitWater(vec3 p, vec3 r, vec3 up, float surfaceOffset,
+                           vec3 wb, out float tOut, out vec3 nOut,
+                           out float viaSurface) {
+                const float PARALLEL_EPS = 0.0001;
+                const float HIT_EPS = 0.0001;
+                float tBox;
+                vec3 boxNormal;
+                bool boxHit = exitBox(p, r, wb, tBox, boxNormal);
+
+                // Signed plane intersection supports either ray direction. The
+                // forward-hit and tank-bound checks reject behind-camera and
+                // out-of-volume candidates, including face-up parallel rays.
+                float ds = dot(r, up);
+                float tSurface = 1e9;
+                vec3 surfaceNormal = ds >= 0.0 ? normalize(up) : -normalize(up);
+                if (abs(ds) > PARALLEL_EPS) {
+                    float candidate = -(dot(p, up) + surfaceOffset) / ds;
+                    if (candidate > HIT_EPS && candidate < 1e8) {
+                        vec3 q = p + r * candidate;
+                        if (insideExitBounds(q, wb)) tSurface = candidate;
+                    }
+                }
+
+                if (tSurface < tBox) {
+                    tOut = tSurface;
+                    nOut = surfaceNormal;
+                    viaSurface = 1.0;
+                    return true;
+                }
+                if (boxHit) {
+                    tOut = tBox;
+                    nOut = boxNormal;
+                    viaSurface = 0.0;
+                    return true;
+                }
+                tOut = 1e9;
+                nOut = vec3(0.0);
+                viaSurface = 0.0;
+                return false;
+            }
+            vec3 sampleBackdrop(vec3 p, vec3 r) {
+                // Select the far plane in the ray's travel direction. This explicitly
+                // handles positive-Z rays instead of clamping them to the rear plane.
+                float planeZ = r.z < 0.0 ? -0.80 : 0.80;
+                if (abs(r.z) < 0.0001) return vec3(0.008, 0.022, 0.030);
+                float t = max((planeZ - p.z) / r.z, 0.0);
+                vec3 q = p + r * t;
+                float gx = abs(fract(q.x * 5.0) - 0.5);
+                float gy = abs(fract(q.y * 5.0) - 0.5);
+                float grid = 1.0 - smoothstep(0.04, 0.10, min(gx, gy));
+                return vec3(0.010, 0.031, 0.043) +
+                       vec3(0.012, 0.036, 0.043) * grid * 0.22;
             }
             void main() {
                 vec2 uv = vUv;
@@ -491,6 +595,82 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
 
                     color = mix(body, top, surfaceFactor);
 
+                    // Two-interface optical transport through the actual water path.
+                    // The inner box is a conservative analytic approximation of the
+                    // rounded tank; every start is checked before slab exits are used.
+                    vec3 entryNormal = normalize(n);
+                    if (dot(rd, entryNormal) > 0.0) entryNormal = -entryNormal;
+                    vec3 rayInside = refract(rd, entryNormal, 1.0 / 1.33);
+                    if (dot(rayInside, rayInside) > 0.000001) {
+                        vec3 wb = TANK - vec3(0.018);
+                        vec3 insidePoint = hit + rayInside * 0.004;
+                        bool insideStart = sdRoundBox(insidePoint, wb, 0.0) < -0.0005 &&
+                                           dot(insidePoint, up) + uSurfaceOffset < 0.0;
+                        if (insideStart) {
+                            float totalWaterLength = 0.0;
+                            vec3 exitPoint = insidePoint;
+                            vec3 exitNormal = up;
+                            vec3 rayOutside = vec3(0.0);
+                            bool escaped = false;
+
+                            // At most one internal-reflection retry. A second TIR
+                            // deliberately falls back to an absorbed internal tint;
+                            // it must never sample the backdrop from inside the water.
+                            for (int bounce = 0; bounce < 2; bounce++) {
+                                float viaSurface;
+                                float segmentLength;
+                                vec3 candidateNormal;
+                                bool foundExit = exitWater(insidePoint, rayInside, up,
+                                    uSurfaceOffset, wb, segmentLength, candidateNormal, viaSurface);
+                                if (!foundExit || segmentLength <= 0.0001 ||
+                                    segmentLength >= 1e8 ||
+                                    any(isnan(candidateNormal)) || any(isinf(candidateNormal)) ||
+                                    dot(candidateNormal, candidateNormal) < 0.5) break;
+                                totalWaterLength += segmentLength;
+                                exitPoint = insidePoint + rayInside * segmentLength;
+                                exitNormal = normalize(candidateNormal);
+                                rayOutside = refract(rayInside, -exitNormal, 1.33);
+                                if (dot(rayOutside, rayOutside) > 0.000001) {
+                                    escaped = true;
+                                    break;
+                                }
+                                if (bounce == 1) break;
+                                rayInside = reflect(rayInside, exitNormal);
+                                insidePoint = exitPoint - exitNormal * 0.004 + rayInside * 0.002;
+                                insideStart = sdRoundBox(insidePoint, wb, 0.0) < -0.0005 &&
+                                              dot(insidePoint, up) + uSurfaceOffset < 0.0;
+                                if (!insideStart) break;
+                            }
+
+                            vec3 absorption = vec3(1.10, 0.48, 0.30);
+                            vec3 transmittance = exp(-absorption * totalWaterLength);
+                            if (escaped) {
+                                vec3 farGlass = sampleBackdrop(exitPoint + rayOutside * 0.003,
+                                                                normalize(rayOutside));
+                                float causticLight = triCaustics(exitPoint, exitNormal);
+                                float bubbleLight = bubbles(exitPoint.xy, uTime * 0.72);
+                                farGlass += vec3(0.10, 0.39, 0.39) * causticLight * 0.55;
+                                farGlass += vec3(0.48, 0.82, 0.78) * bubbleLight * 0.28;
+                                vec3 inScatter = vec3(0.018, 0.105, 0.115) *
+                                                 (1.0 - transmittance);
+                                vec3 transmitted = farGlass * transmittance + inScatter;
+
+                                vec3 reflectedRay = reflect(rd, entryNormal);
+                                vec3 reflected = sampleBackdrop(hit + entryNormal * 0.004,
+                                                                 reflectedRay);
+                                float cosEntry = clamp(-dot(rd, entryNormal), 0.0, 1.0);
+                                float cosExit = clamp(dot(rayInside, exitNormal), 0.0, 1.0);
+                                float fEntry = 0.0204 + 0.9796 * pow(1.0 - cosEntry, 5.0);
+                                float fExit = 0.0204 + 0.9796 * pow(1.0 - cosExit, 5.0);
+                                float fresnel = 1.0 - (1.0 - fEntry) * (1.0 - fExit);
+                                color = mix(transmitted, reflected, clamp(fresnel, 0.0, 0.45));
+                            } else {
+                                color = vec3(0.012, 0.055, 0.072) * transmittance +
+                                        vec3(0.006, 0.022, 0.030);
+                            }
+                        }
+                    }
+
                     // Thin warm-ivory meniscus where the water meets the glass.
                     float foam = 1.0 - smoothstep(0.006, 0.026, abs(s));
                     float sideFace = 1.0 - surfaceFactor;
@@ -529,7 +709,13 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val quad = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
         vertexBuffer = ByteBuffer.allocateDirect(quad.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
         vertexBuffer.put(quad).position(0)
-        program = linkProgram(vertex, fragment)
+        program = try {
+            linkProgram(vertex, fragment)
+        } catch (error: Exception) {
+            onDiagnostics("GLSL initialization failed: ${error.message ?: "unknown shader error"}")
+            0
+        }
+        if (program == 0) return
         timeHandle = GLES30.glGetUniformLocation(program, "uTime")
         upHandle = GLES30.glGetUniformLocation(program, "uUp")
         eyeHandle = GLES30.glGetUniformLocation(program, "uEye")
@@ -542,8 +728,13 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         GLES30.glGenTextures(1, textureIds, 0)
         fluidHeightTexture = textureIds[0]
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, fluidHeightTexture)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
-        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        // R32F linear filtering is not guaranteed on every ES 3.0 device.
+        // Use linear when the extension is exposed; otherwise fall back safely.
+        val floatLinear = GLES30.glGetString(GLES30.GL_EXTENSIONS)
+            ?.contains("GL_OES_texture_float_linear") == true
+        val heightFilter = if (floatLinear) GLES30.GL_LINEAR else GLES30.GL_NEAREST
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, heightFilter)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, heightFilter)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
         val gridSize = fluidSimulation.resolution()
@@ -554,14 +745,55 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
     }
 
     override fun onSurfaceChanged(glUnused: javax.microedition.khronos.opengles.GL10?, width: Int, height: Int) {
-        GLES30.glViewport(0, 0, width, height)
+        surfaceWidth = width.coerceAtLeast(1)
+        surfaceHeight = height.coerceAtLeast(1)
+        // 85% on each axis preserves the aspect ratio and shades ~72% as many pixels.
+        sceneWidth = (surfaceWidth * 0.85f).toInt().coerceAtLeast(1)
+        sceneHeight = (surfaceHeight * 0.85f).toInt().coerceAtLeast(1)
+
+        if (sceneFramebuffer == 0) {
+            val ids = IntArray(1)
+            GLES30.glGenFramebuffers(1, ids, 0)
+            sceneFramebuffer = ids[0]
+        }
+        if (sceneColorTexture == 0) {
+            val ids = IntArray(1)
+            GLES30.glGenTextures(1, ids, 0)
+            sceneColorTexture = ids[0]
+        }
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sceneColorTexture)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8,
+            sceneWidth, sceneHeight, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, sceneFramebuffer)
+        GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
+            GLES30.GL_TEXTURE_2D, sceneColorTexture, 0)
+        sceneFramebufferReady =
+            GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER) == GLES30.GL_FRAMEBUFFER_COMPLETE
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        GLES30.glViewport(0, 0, surfaceWidth, surfaceHeight)
     }
 
     override fun onDrawFrame(glUnused: javax.microedition.khronos.opengles.GL10?) {
         val now = System.nanoTime()
         val dt = ((now - lastNanos) / 1_000_000_000f).coerceIn(0f, 0.05f)
         lastNanos = now
-        shake = max(0f, shake - dt * 1.25f)
+        val frameShake: Float
+        val kickX: Float
+        val kickZ: Float
+        synchronized(shakeLock) {
+            shake = max(0f, shake - dt * 1.25f)
+            frameShake = shake
+            kickX = pendingShakeX
+            kickZ = pendingShakeZ
+            pendingShakeX = 0f
+            pendingShakeZ = 0f
+        }
 
         // A 0.7 Hz damped spring (zeta 0.30) gives the whole gravity vector
         // physical follow-through. Substeps keep integration stable across frame rates.
@@ -596,21 +828,25 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         springGravityZ /= springLength
 
         // Shake contributes a short momentum kick, never a change to the sensor target.
-        val kickX = pendingShakeX
-        val kickZ = pendingShakeZ
-        pendingShakeX = 0f
-        pendingShakeZ = 0f
         springVelocityX += kickX
         springVelocityZ += kickZ
         fluidSimulation.step(dt)
         val time = (now - startNanos) / 1_000_000_000f
+        if (program == 0) return
+        if (sceneFramebufferReady) {
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, sceneFramebuffer)
+            GLES30.glViewport(0, 0, sceneWidth, sceneHeight)
+        } else {
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+            GLES30.glViewport(0, 0, surfaceWidth, surfaceHeight)
+        }
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
         GLES30.glUseProgram(program)
         val up = computeUp(springGravityX, springGravityY, springGravityZ)
         GLES30.glUniform1f(timeHandle, time)
         GLES30.glUniform3f(upHandle, up[0], up[1], up[2])
         GLES30.glUniform2f(eyeHandle, eyeX, eyeY)
-        GLES30.glUniform1f(shakeHandle, shake)
+        GLES30.glUniform1f(shakeHandle, frameShake)
         val rawSurfaceOffset = volumeSolver.offsetForHalfFill(up[0], up[1], up[2])
         if (rawSurfaceOffset.isFinite()) {
             lastGoodSurfaceOffset = rawSurfaceOffset.coerceIn(-1.5f, 1.5f)
@@ -625,14 +861,27 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
         val gridSize = fluidSimulation.resolution()
         GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, gridSize, gridSize,
             GLES30.GL_RED, GLES30.GL_FLOAT, heightData)
-        val viewport = IntArray(4)
-        GLES30.glGetIntegerv(GLES30.GL_VIEWPORT, viewport, 0)
-        GLES30.glUniform2f(resolutionHandle, viewport[2].toFloat(), viewport[3].toFloat())
+        val renderWidth = if (sceneFramebufferReady) sceneWidth else surfaceWidth
+        val renderHeight = if (sceneFramebufferReady) sceneHeight else surfaceHeight
+        GLES30.glUniform2f(resolutionHandle, renderWidth.toFloat(), renderHeight.toFloat())
         vertexBuffer.position(0)
         GLES30.glEnableVertexAttribArray(0)
         GLES30.glVertexAttribPointer(0, 2, GLES30.GL_FLOAT, false, 0, vertexBuffer)
         GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
         GLES30.glDisableVertexAttribArray(0)
+
+        // Upscale the completed scene in one hardware blit; no extra shader pass.
+        if (sceneFramebufferReady) {
+            GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER, sceneFramebuffer)
+            GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER, 0)
+            GLES30.glBlitFramebuffer(
+                0, 0, sceneWidth, sceneHeight,
+                0, 0, surfaceWidth, surfaceHeight,
+                GLES30.GL_COLOR_BUFFER_BIT, GLES30.GL_LINEAR
+            )
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+            GLES30.glViewport(0, 0, surfaceWidth, surfaceHeight)
+        }
 
         frameCounter++
         if (now - lastDiagnosticsNanos >= 250_000_000L) {
