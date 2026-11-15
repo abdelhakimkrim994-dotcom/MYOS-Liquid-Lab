@@ -415,36 +415,81 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                 hit = vec3(0.0);
                 return false;
             }
-            // Axis-aligned inner-box exit. Parallel axes contribute infinity,
-            // never a fabricated near-zero exit. Corner ties choose one stable face.
-            float exitBox(vec3 p, vec3 r, vec3 wb, out vec3 nOut) {
-                float tx = r.x > 0.00001 ? ( wb.x - p.x) / r.x :
-                           r.x < -0.00001 ? (-wb.x - p.x) / r.x : 1e9;
-                float ty = r.y > 0.00001 ? ( wb.y - p.y) / r.y :
-                           r.y < -0.00001 ? (-wb.y - p.y) / r.y : 1e9;
-                float tz = r.z > 0.00001 ? ( wb.z - p.z) / r.z :
-                           r.z < -0.00001 ? (-wb.z - p.z) / r.z : 1e9;
-                float t = min(tx, min(ty, tz));
-                if (tx <= ty && tx <= tz) nOut = vec3(sign(r.x), 0.0, 0.0);
-                else if (ty <= tz) nOut = vec3(0.0, sign(r.y), 0.0);
-                else nOut = vec3(0.0, 0.0, sign(r.z));
-                return max(t, 0.0);
+            // All exit candidates are forward intersections with the bounded
+            // inner tank. Near-parallel axes are skipped instead of divided by.
+            bool insideExitBounds(vec3 p, vec3 wb) {
+                return all(lessThanEqual(abs(p), wb + vec3(0.0025)));
             }
-            float exitWater(vec3 p, vec3 r, vec3 up, float surfaceOffset,
-                            vec3 wb, out vec3 nOut, out float viaSurface) {
-                vec3 boxNormal;
-                float tBox = exitBox(p, r, wb, boxNormal);
-                float ds = dot(r, up);
-                float tSurface = ds > 0.0001
-                    ? max(-(dot(p, up) + surfaceOffset) / ds, 0.0) : 1e9;
-                if (tSurface < tBox) {
-                    nOut = normalize(up);
-                    viaSurface = 1.0;
-                    return tSurface;
+            bool exitBox(vec3 p, vec3 r, vec3 wb,
+                         out float tOut, out vec3 nOut) {
+                const float EPS = 0.00001;
+                const float HIT_EPS = 0.0001;
+                tOut = 1e9;
+                nOut = vec3(0.0);
+                if (!insideExitBounds(p, wb)) return false;
+
+                if (abs(r.x) > EPS) {
+                    float t = (sign(r.x) * wb.x - p.x) / r.x;
+                    vec3 q = p + r * t;
+                    if (t > HIT_EPS && t < tOut && insideExitBounds(q, wb)) {
+                        tOut = t; nOut = vec3(sign(r.x), 0.0, 0.0);
+                    }
                 }
-                nOut = normalize(boxNormal);
+                if (abs(r.y) > EPS) {
+                    float t = (sign(r.y) * wb.y - p.y) / r.y;
+                    vec3 q = p + r * t;
+                    if (t > HIT_EPS && t < tOut && insideExitBounds(q, wb)) {
+                        tOut = t; nOut = vec3(0.0, sign(r.y), 0.0);
+                    }
+                }
+                if (abs(r.z) > EPS) {
+                    float t = (sign(r.z) * wb.z - p.z) / r.z;
+                    vec3 q = p + r * t;
+                    if (t > HIT_EPS && t < tOut && insideExitBounds(q, wb)) {
+                        tOut = t; nOut = vec3(0.0, 0.0, sign(r.z));
+                    }
+                }
+                return tOut < 1e8 && dot(nOut, nOut) > 0.5;
+            }
+            bool exitWater(vec3 p, vec3 r, vec3 up, float surfaceOffset,
+                           vec3 wb, out float tOut, out vec3 nOut,
+                           out float viaSurface) {
+                const float PARALLEL_EPS = 0.0001;
+                const float HIT_EPS = 0.0001;
+                float tBox;
+                vec3 boxNormal;
+                bool boxHit = exitBox(p, r, wb, tBox, boxNormal);
+
+                // Signed plane intersection supports either ray direction. The
+                // forward-hit and tank-bound checks reject behind-camera and
+                // out-of-volume candidates, including face-up parallel rays.
+                float ds = dot(r, up);
+                float tSurface = 1e9;
+                vec3 surfaceNormal = ds >= 0.0 ? normalize(up) : -normalize(up);
+                if (abs(ds) > PARALLEL_EPS) {
+                    float candidate = -(dot(p, up) + surfaceOffset) / ds;
+                    if (candidate > HIT_EPS && candidate < 1e8) {
+                        vec3 q = p + r * candidate;
+                        if (insideExitBounds(q, wb)) tSurface = candidate;
+                    }
+                }
+
+                if (tSurface < tBox) {
+                    tOut = tSurface;
+                    nOut = surfaceNormal;
+                    viaSurface = 1.0;
+                    return true;
+                }
+                if (boxHit) {
+                    tOut = tBox;
+                    nOut = boxNormal;
+                    viaSurface = 0.0;
+                    return true;
+                }
+                tOut = 1e9;
+                nOut = vec3(0.0);
                 viaSurface = 0.0;
-                return tBox;
+                return false;
             }
             vec3 sampleBackdrop(vec3 p, vec3 r) {
                 // Select the far plane in the ray's travel direction. This explicitly
@@ -561,11 +606,14 @@ private class LiquidRenderer(private val onDiagnostics: (String) -> Unit) : GLSu
                             // it must never sample the backdrop from inside the water.
                             for (int bounce = 0; bounce < 2; bounce++) {
                                 float viaSurface;
+                                float segmentLength;
                                 vec3 candidateNormal;
-                                float segmentLength = exitWater(insidePoint, rayInside, up,
-                                    uSurfaceOffset, wb, candidateNormal, viaSurface);
-                                if (segmentLength >= 1e8) break;
-                                segmentLength = max(segmentLength, 0.0);
+                                bool foundExit = exitWater(insidePoint, rayInside, up,
+                                    uSurfaceOffset, wb, segmentLength, candidateNormal, viaSurface);
+                                if (!foundExit || segmentLength <= 0.0001 ||
+                                    segmentLength >= 1e8 ||
+                                    any(isnan(candidateNormal)) || any(isinf(candidateNormal)) ||
+                                    dot(candidateNormal, candidateNormal) < 0.5) break;
                                 totalWaterLength += segmentLength;
                                 exitPoint = insidePoint + rayInside * segmentLength;
                                 exitNormal = normalize(candidateNormal);
